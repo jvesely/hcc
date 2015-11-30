@@ -19,6 +19,12 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/ConstantsScanner.h"
+#define MXPA_CODEGEN 1
+#ifdef MXPA_CODEGEN
+#include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/Analysis/ScalarEvolutionExpressions.h"
+#include "llvm/Support/Path.h"
+#endif
 #include "llvm/Config/config.h"
 #include "llvm/CodeGen/IntrinsicLowering.h"
 #include "llvm/CodeGen/Passes.h"
@@ -41,6 +47,7 @@
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/FormattedStream.h"
 #include "llvm/IR/GetElementPtrTypeIterator.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/TargetRegistry.h"
 #include "llvm/Support/Host.h"
@@ -49,12 +56,19 @@
 #include <algorithm>
 #include <cstdio>
 #include <set>
+#include <iostream>
+#include <sstream>
 
 // Some ms header decided to define setjmp as _setjmp, undo this for this file.
 #ifdef _MSC_VER
 #undef setjmp
 #endif
 using namespace llvm;
+
+// Switch of OpenCL C kernel compilation
+static cl::opt<bool> CompileOpenCLKernel(
+  "compile-opencl-kernel", cl::Hidden,
+  cl::desc("Compile OpenCL C kernel"), cl::init(false));
 
 extern "C" void LLVMInitializeCBackendTarget() {
   // Register the target.
@@ -100,6 +114,25 @@ class CWriter : public FunctionPass, public InstVisitor<CWriter> {
   /// UnnamedStructIDs - This contains a unique ID for each struct that is
   /// either anonymous or has no name.
   DenseMap<StructType *, unsigned> UnnamedStructIDs;
+  std::string bcHash;
+#ifdef MXPA_CODEGEN
+  ScalarEvolution *SE;
+  std::map<Value *, std::set<const SCEV *> > MemoryAccesses;
+  std::map<Value *, const SCEV *> MemoryElementSize;
+  std::set<const SCEV *> MemoryWrites;
+  AttributeSet KernelFunctionAS;
+  std::set<const Function *> KernelFnCallees;
+  std::set<const Function *> InlinedCallees;
+  std::set<const Function *> NonInlinedCallees;
+  std::vector<std::string> kernelList;
+  std::vector< std::vector<unsigned int> > work_group_list;
+  std::vector< std::vector<std::string> > arg_addr_space_list;
+  std::vector< std::vector<std::string> > arg_access_qual_list;
+  std::vector< std::vector<std::string> > arg_type_list;
+  std::vector< std::vector<std::string> > arg_type_qual_list;
+  std::vector< std::vector<std::string> > arg_name_list;
+  std::set<const Function *> LaunchKernels;
+#endif
 
 public:
   static char ID;
@@ -117,12 +150,19 @@ public:
 
   void getAnalysisUsage(AnalysisUsage &AU) const {
     AU.addRequired<LoopInfo>();
+    AU.addRequired<ScalarEvolution>();
     AU.setPreservesAll();
   }
 
   virtual bool doInitialization(Module &M);
 
   bool runOnFunction(Function &F) {
+#ifdef MXPA_CODEGEN
+    MemoryAccesses.clear();
+    MemoryElementSize.clear();
+    MemoryWrites.clear();
+    SE = &getAnalysis<ScalarEvolution>();
+#endif
     // Do not codegen any 'available_externally' functions at all, they have
     // definitions outside the translation unit.
     if (F.hasAvailableExternallyLinkage()) {
@@ -135,13 +175,31 @@ public:
     lowerIntrinsics(F);
 
     // Output all floating point constants that cannot be printed accurately.
+#ifdef MXPA_CODEGEN
+    Out << "\n#ifndef QUERIES\n";
+#endif
     printFloatingPointConstants(F);
-
     printFunction(F);
+#ifdef MXPA_CODEGEN
+      Out << "\n#endif\n";
+#endif
+
+#ifdef MXPA_CODEGEN
+    if (isKernelFunction(&F) && !CompileOpenCLKernel) {
+      Out << "\n#ifdef QUERIES\n";
+      printMXPABounds(F, true);
+      printMXPABounds(F, false);
+      printMXPAArgQueries(F);
+      Out << "\n#endif\n";
+    }
+#endif
     return false;
   }
 
   virtual bool doFinalization(Module &M) {
+    if (!CompileOpenCLKernel) {
+      //printMXPAKernelRegister();
+    }
     // Free memory...
     delete IL;
     delete TD;
@@ -164,7 +222,8 @@ public:
                          const AttributeSet &PAL = AttributeSet());
   raw_ostream &printSimpleType(raw_ostream &Out, Type *Ty,
                                bool isSigned,
-                               const std::string &NameSoFar = "");
+                               const std::string &NameSoFar = "",
+                               bool isOpenCLC = false);
 
   void printStructReturnPointerFunctionType(raw_ostream &Out,
       const AttributeSet &PAL,
@@ -196,6 +255,13 @@ public:
 
   void writeMemoryAccess(Value *Operand, Type *OperandType,
                          bool IsVolatile, unsigned Alignment);
+#ifdef MXPA_CODEGEN
+  void writeBounds(const SCEV *, bool isUpperBound, Value *arg);
+  void CheckBounds(const SCEV *, bool isUpperBound, char &ret);
+  void writeBoundsUnknown(Value *, bool isUpperBound, Value *arg);
+  void writeLoadInst(Value *Operand, Type *OperandType,
+                     bool IsVolatile, unsigned Alignment, bool, Value *arg);
+#endif
 
 private :
   std::string InterpretASMConstraint(InlineAsm::ConstraintInfo &c);
@@ -208,10 +274,35 @@ private :
   void printModuleTypes();
   void printContainedStructs(Type *Ty, SmallPtrSet<Type *, 16> &);
   void printFloatingPointConstants(Function &F);
+  void printFloatingPointConstantDataSequentials(
+    const ConstantDataSequential *CDS);
   void printFloatingPointConstants(const Constant *C);
   void printFunctionSignature(const Function *F, bool Prototype);
 
   void printFunction(Function &);
+#ifdef MXPA_CODEGEN
+  void getKernelFnCallees(const Module &M);
+  void getInlinedCallees(const Module &M);
+  void getCommonToKernels(const Module &M);
+  void getLaunchKernels(const Module &M);
+  bool isUselessFunction(Function &F);
+  bool isLaunchKernel(const Function &F);
+  void printMXPAWrapper(Function &);
+  void printMXPAKernelRegister();
+  bool collectKernelInfo();
+  void printMXPABounds(Function &F, bool Upper);
+  void printMXPABndsForSlctInst(Value *V, bool Upper);
+  void printMXPABndsCommCase(
+    std::map<Value *, std::set<const SCEV *> >::iterator &it,
+    bool Upper);
+  void printMXPAArgQueries(Function &F);
+  void printMXPAArgCommCase(
+    std::map<Value *, std::set<const SCEV *> >::iterator &it);
+  void printMXPAArgForSlctInst(Value *V);
+  bool NeedHndlMXPAForSlctInst(Value *V);
+  void hndlMXPABndsForSlctInst(Value *V, bool Upper);
+  void hndlMXPAArgForSlctInst(Value *V);
+#endif
   void printBasicBlock(BasicBlock *BB);
   void printLoop(Loop *L);
 
@@ -362,11 +453,9 @@ private :
   void incorporateValue(const Module &M, const Value *V);
   void incorporateMDNode(const Module &M, const MDNode *V);
 };
-}
+} //End of namespace
 
 char CWriter::ID = 0;
-
-
 
 static std::string CBEMangle(const std::string &S) {
   std::string Result;
@@ -390,7 +479,6 @@ std::string CWriter::getStructName(StructType *ST) {
 
   return "l_unnamed_" + utostr(UnnamedStructIDs[ST]);
 }
-
 
 /// printStructReturnPointerFunctionType - This is like printType for a struct
 /// return type, except, instead of printing the type as void (*)(Struct*, ...)
@@ -435,35 +523,51 @@ void CWriter::printStructReturnPointerFunctionType(raw_ostream &Out,
 
 raw_ostream &
 CWriter::printSimpleType(raw_ostream &Out, Type *Ty, bool isSigned,
-                         const std::string &NameSoFar) {
+                         const std::string &NameSoFar, bool isOpenCLC) {
   assert(((Ty->getTypeID() >= 0 && Ty->getTypeID() <= 9) || Ty->isIntegerTy() || Ty->isVectorTy()) &&
          "Invalid type for printSimpleType");
   switch (Ty->getTypeID()) {
-    case Type::VoidTyID:   return Out << "void " << NameSoFar;
+    case Type::VoidTyID:
+      return Out << "void " << NameSoFar;
     case Type::IntegerTyID: {
         unsigned NumBits = cast<IntegerType>(Ty)->getBitWidth();
-        if (NumBits == 1) {
-          return Out << "bool " << NameSoFar;
-        } else if (NumBits <= 8) {
-          return Out << (isSigned ? "signed" : "unsigned") << " char " << NameSoFar;
-        } else if (NumBits <= 16) {
-          return Out << (isSigned ? "signed" : "unsigned") << " short " << NameSoFar;
-        } else if (NumBits <= 32) {
-          return Out << (isSigned ? "signed" : "unsigned") << " int " << NameSoFar;
-        } else if (NumBits <= 64) {
-          return Out << (isSigned ? "signed" : "unsigned") << " long " << NameSoFar;
+        if (isOpenCLC) {
+          if (NumBits == 8) {
+            return Out << (isSigned ? "" : "u") << "char" << NameSoFar;
+          } else if (NumBits == 16) {
+            return Out << (isSigned ? "" : "u") << "short" << NameSoFar;
+          } else if (NumBits == 32) {
+            return Out << (isSigned ? "" : "u") << "int" << NameSoFar;
+          } else if (NumBits == 64) {
+            return Out << (isSigned ? "" : "u") << "long" << NameSoFar;
+          }
         } else {
-          assert(NumBits <= 128 && "Bit widths > 128 not implemented yet");
-          return Out << (isSigned ? "llvmInt128" : "llvmUInt128") << " " << NameSoFar;
+          if (NumBits == 1) {
+            return Out << "bool " << NameSoFar;
+          } else if (NumBits <= 8) {
+            return Out << (isSigned ? "signed" : "unsigned") << " char " << NameSoFar;
+          } else if (NumBits <= 16) {
+            return Out << (isSigned ? "signed" : "unsigned") << " short " << NameSoFar;
+          } else if (NumBits <= 32) {
+            return Out << (isSigned ? "signed" : "unsigned") << " int " << NameSoFar;
+          } else if (NumBits <= 64) {
+            return Out << (isSigned ? "signed" : "unsigned") << " long " << NameSoFar;
+          } else {
+            assert(NumBits <= 128 && "Bit widths > 128 not implemented yet");
+            return Out << (isSigned ? "int4" : "uint4") << " " << NameSoFar;
+          }
         }
       }
-    case Type::FloatTyID:  return Out << "float "   << NameSoFar;
-    case Type::DoubleTyID: return Out << "double "  << NameSoFar;
+    case Type::FloatTyID:
+      return Out << "float "   << NameSoFar;
+    case Type::DoubleTyID:
+      return Out << "double "  << NameSoFar;
       // Lacking emulation of FP80 on PPC, etc., we assume whichever of these is
       // present matches host 'long double'.
     case Type::X86_FP80TyID:
     case Type::PPC_FP128TyID:
-    case Type::FP128TyID:  return Out << "long double " << NameSoFar;
+    case Type::FP128TyID:
+      return Out << "long double " << NameSoFar;
 
     case Type::X86_MMXTyID:
       return printSimpleType(Out, Type::getInt32Ty(Ty->getContext()), isSigned,
@@ -471,6 +575,8 @@ CWriter::printSimpleType(raw_ostream &Out, Type *Ty, bool isSigned,
 
     case Type::VectorTyID: {
         VectorType *VTy = cast<VectorType>(Ty);
+        unsigned numElements = VTy->getVectorNumElements();
+        std::string n = numElements > 1 ? utostr(numElements) : "";
         return printSimpleType(Out, VTy->getElementType(), isSigned,
                                " __attribute__((vector_size(" +
                                utostr(TD->getTypeAllocSize(VTy)) + " ))) " + NameSoFar);
@@ -667,13 +773,27 @@ void CWriter::printConstantDataSequential(ConstantDataSequential *CDS,
       } else {
         LastWasHex = false;
         switch (C) {
-          case '\n': Out << "\\n"; break;
-          case '\t': Out << "\\t"; break;
-          case '\r': Out << "\\r"; break;
-          case '\v': Out << "\\v"; break;
-          case '\a': Out << "\\a"; break;
-          case '\"': Out << "\\\""; break;
-          case '\'': Out << "\\\'"; break;
+          case '\n':
+            Out << "\\n";
+            break;
+          case '\t':
+            Out << "\\t";
+            break;
+          case '\r':
+            Out << "\\r";
+            break;
+          case '\v':
+            Out << "\\v";
+            break;
+          case '\a':
+            Out << "\\a";
+            break;
+          case '\"':
+            Out << "\\\"";
+            break;
+          case '\'':
+            Out << "\\\'";
+            break;
           default:
             Out << "\\x";
             Out << (char)((C / 16  < 10) ? (C / 16 + '0') : (C / 16 - 10 + 'A'));
@@ -761,14 +881,37 @@ static bool isFPCSafeToPrint(const ConstantFP *CFP) {
 /// @brief Print a cast
 void CWriter::printCast(unsigned opc, Type *SrcTy, Type *DstTy) {
   // Print the destination type cast
+  bool is128Bit = false;
+  if (DstTy->getTypeID() == Type::IntegerTyID) {
+    unsigned NumBits = cast<IntegerType>(DstTy)->getBitWidth();
+    if (NumBits == 128) {
+      is128Bit = true;
+    }
+  }
   switch (opc) {
     case Instruction::UIToFP:
     case Instruction::SIToFP:
     case Instruction::IntToPtr:
     case Instruction::Trunc:
+      if (SrcTy->getTypeID() == Type::IntegerTyID) {
+        unsigned n = cast<IntegerType>(SrcTy)->getBitWidth();
+        if (n == 128) {
+          Out << '(';
+          printSimpleType(Out, DstTy, false);
+          Out << "*)";
+          break;
+        }
+      }
     case Instruction::BitCast:
+      if (is128Bit) {
+        Out << '(';
+        printSimpleType(Out, DstTy, false);
+        Out << "*)";
+        break;
+      }
     case Instruction::FPExt:
     case Instruction::FPTrunc: // For these the DstTy sign doesn't matter
+    case Instruction::AddrSpaceCast:
       Out << '(';
       printType(Out, DstTy);
       Out << ')';
@@ -811,10 +954,15 @@ void CWriter::printCast(unsigned opc, Type *SrcTy, Type *DstTy) {
       break;
     case Instruction::Trunc:
     case Instruction::BitCast:
+      if (is128Bit) {
+        Out << '&';
+        break;
+      }
     case Instruction::FPExt:
     case Instruction::FPTrunc:
     case Instruction::FPToSI:
     case Instruction::FPToUI:
+    case Instruction::AddrSpaceCast:
       break; // These don't need a source cast.
     default:
       llvm_unreachable("Invalid cast opcode");
@@ -895,39 +1043,73 @@ void CWriter::printConstant(Constant *CPV, bool Static) {
           printConstantWithCast(CE->getOperand(0), CE->getOpcode());
           switch (CE->getOpcode()) {
             case Instruction::Add:
-            case Instruction::FAdd: Out << " + "; break;
+            case Instruction::FAdd:
+              Out << " + ";
+              break;
             case Instruction::Sub:
-            case Instruction::FSub: Out << " - "; break;
+            case Instruction::FSub:
+              Out << " - ";
+              break;
             case Instruction::Mul:
-            case Instruction::FMul: Out << " * "; break;
+            case Instruction::FMul:
+              Out << " * ";
+              break;
             case Instruction::URem:
             case Instruction::SRem:
-            case Instruction::FRem: Out << " % "; break;
+            case Instruction::FRem:
+              Out << " % ";
+              break;
             case Instruction::UDiv:
             case Instruction::SDiv:
-            case Instruction::FDiv: Out << " / "; break;
-            case Instruction::And: Out << " & "; break;
-            case Instruction::Or:  Out << " | "; break;
-            case Instruction::Xor: Out << " ^ "; break;
-            case Instruction::Shl: Out << " << "; break;
+            case Instruction::FDiv:
+              Out << " / ";
+              break;
+            case Instruction::And:
+              Out << " & ";
+              break;
+            case Instruction::Or:
+              Out << " | ";
+              break;
+            case Instruction::Xor:
+              Out << " ^ ";
+              break;
+            case Instruction::Shl:
+              Out << " << ";
+              break;
             case Instruction::LShr:
-            case Instruction::AShr: Out << " >> "; break;
+            case Instruction::AShr:
+              Out << " >> ";
+              break;
             case Instruction::ICmp:
               switch (CE->getPredicate()) {
-                case ICmpInst::ICMP_EQ: Out << " == "; break;
-                case ICmpInst::ICMP_NE: Out << " != "; break;
+                case ICmpInst::ICMP_EQ:
+                  Out << " == ";
+                  break;
+                case ICmpInst::ICMP_NE:
+                  Out << " != ";
+                  break;
                 case ICmpInst::ICMP_SLT:
-                case ICmpInst::ICMP_ULT: Out << " < "; break;
+                case ICmpInst::ICMP_ULT:
+                  Out << " < ";
+                  break;
                 case ICmpInst::ICMP_SLE:
-                case ICmpInst::ICMP_ULE: Out << " <= "; break;
+                case ICmpInst::ICMP_ULE:
+                  Out << " <= ";
+                  break;
                 case ICmpInst::ICMP_SGT:
-                case ICmpInst::ICMP_UGT: Out << " > "; break;
+                case ICmpInst::ICMP_UGT:
+                  Out << " > ";
+                  break;
                 case ICmpInst::ICMP_SGE:
-                case ICmpInst::ICMP_UGE: Out << " >= "; break;
-                default: llvm_unreachable("Illegal ICmp predicate");
+                case ICmpInst::ICMP_UGE:
+                  Out << " >= ";
+                  break;
+                default:
+                  llvm_unreachable("Illegal ICmp predicate");
               }
               break;
-            default: llvm_unreachable("Illegal opcode here!");
+            default:
+              llvm_unreachable("Illegal opcode here!");
           }
           printConstantWithCast(CE->getOperand(1), CE->getOpcode());
           if (NeedsClosingParens) {
@@ -946,21 +1128,50 @@ void CWriter::printConstant(Constant *CPV, bool Static) {
           } else {
             const char *op = 0;
             switch (CE->getPredicate()) {
-              default: llvm_unreachable("Illegal FCmp predicate");
-              case FCmpInst::FCMP_ORD: op = "ord"; break;
-              case FCmpInst::FCMP_UNO: op = "uno"; break;
-              case FCmpInst::FCMP_UEQ: op = "ueq"; break;
-              case FCmpInst::FCMP_UNE: op = "une"; break;
-              case FCmpInst::FCMP_ULT: op = "ult"; break;
-              case FCmpInst::FCMP_ULE: op = "ule"; break;
-              case FCmpInst::FCMP_UGT: op = "ugt"; break;
-              case FCmpInst::FCMP_UGE: op = "uge"; break;
-              case FCmpInst::FCMP_OEQ: op = "oeq"; break;
-              case FCmpInst::FCMP_ONE: op = "one"; break;
-              case FCmpInst::FCMP_OLT: op = "olt"; break;
-              case FCmpInst::FCMP_OLE: op = "ole"; break;
-              case FCmpInst::FCMP_OGT: op = "ogt"; break;
-              case FCmpInst::FCMP_OGE: op = "oge"; break;
+              default:
+                llvm_unreachable("Illegal FCmp predicate");
+              case FCmpInst::FCMP_ORD:
+                op = "ord";
+                break;
+              case FCmpInst::FCMP_UNO:
+                op = "uno";
+                break;
+              case FCmpInst::FCMP_UEQ:
+                op = "ueq";
+                break;
+              case FCmpInst::FCMP_UNE:
+                op = "une";
+                break;
+              case FCmpInst::FCMP_ULT:
+                op = "ult";
+                break;
+              case FCmpInst::FCMP_ULE:
+                op = "ule";
+                break;
+              case FCmpInst::FCMP_UGT:
+                op = "ugt";
+                break;
+              case FCmpInst::FCMP_UGE:
+                op = "uge";
+                break;
+              case FCmpInst::FCMP_OEQ:
+                op = "oeq";
+                break;
+              case FCmpInst::FCMP_ONE:
+                op = "one";
+                break;
+              case FCmpInst::FCMP_OLT:
+                op = "olt";
+                break;
+              case FCmpInst::FCMP_OLE:
+                op = "ole";
+                break;
+              case FCmpInst::FCMP_OGT:
+                op = "ogt";
+                break;
+              case FCmpInst::FCMP_OGE:
+                op = "oge";
+                break;
             }
             Out << "llvm_fcmp_" << op << "(";
             printConstantWithCast(CE->getOperand(0), CE->getOpcode());
@@ -1226,10 +1437,15 @@ bool CWriter::printConstExprCast(const ConstantExpr *CE, bool Static) {
       // as unsigned, to avoid undefined behavior on overflow.
     case Instruction::LShr:
     case Instruction::URem:
-    case Instruction::UDiv: NeedsExplicitCast = true; break;
+    case Instruction::UDiv:
+      NeedsExplicitCast = true;
+      break;
     case Instruction::AShr:
     case Instruction::SRem:
-    case Instruction::SDiv: NeedsExplicitCast = true; TypeIsSigned = true; break;
+    case Instruction::SDiv:
+      NeedsExplicitCast = true;
+      TypeIsSigned = true;
+      break;
     case Instruction::SExt:
       Ty = CE->getType();
       NeedsExplicitCast = true;
@@ -1249,7 +1465,8 @@ bool CWriter::printConstExprCast(const ConstantExpr *CE, bool Static) {
       Ty = CE->getType();
       NeedsExplicitCast = true;
       break;
-    default: break;
+    default:
+      break;
   }
   if (NeedsExplicitCast) {
     Out << "((";
@@ -1369,14 +1586,27 @@ void CWriter::writeInstComputationInline(Instruction &I) {
   // We can't currently support integer types other than 1, 8, 16, 32, 64.
   // Validate this.
   Type *Ty = I.getType();
-  if (Ty->isIntegerTy() && (Ty != Type::getInt1Ty(I.getContext()) &&
-                            Ty != Type::getInt8Ty(I.getContext()) &&
-                            Ty != Type::getInt16Ty(I.getContext()) &&
-                            Ty != Type::getInt32Ty(I.getContext()) &&
-                            Ty != Type::getInt64Ty(I.getContext()))) {
-    report_fatal_error("The C backend does not currently support integer "
-                       "types of widths other than 1, 8, 16, 32, 64.\n"
-                       "This is being tracked as PR 4158.");
+  bool isBitCast128Ty = false;
+  if (isa<BitCastInst>(&I) && Ty->isIntegerTy()) {
+    unsigned NumBits = cast<IntegerType>(Ty)->getBitWidth();
+    if (NumBits == 128) {
+      isBitCast128Ty = true;
+    }
+  }
+  if (!isBitCast128Ty) {
+    // FIXME: Remove 24u, 48u, 96u if unnecessarily
+    if (Ty->isIntegerTy() && Ty != Type::getInt1Ty(I.getContext()) &&
+        Ty != Type::getInt8Ty(I.getContext()) &&
+        Ty != Type::getInt16Ty(I.getContext()) &&
+        Ty != Type::getInt32Ty(I.getContext()) &&
+        Ty != Type::getInt64Ty(I.getContext()) /*&&
+        Ty != Type::getIntNTy(I.getContext(), 24u) &&
+        Ty != Type::getIntNTy(I.getContext(), 48u) &&
+        Ty != Type::getIntNTy(I.getContext(), 96u)*/) {
+      report_fatal_error("The C backend does not currently support integer "
+                         "types of widths other than 1, 8, 16, 32, 64.\n"
+                         "This is being tracked as PR 4158.");
+    }
   }
 
   // If this is a non-trivial bool computation, make sure to truncate down to
@@ -1458,7 +1688,8 @@ bool CWriter::writeInstructionCast(const Instruction &I) {
       printSimpleType(Out, Ty, true);
       Out << ")(";
       return true;
-    default: break;
+    default:
+      break;
   }
   return false;
 }
@@ -1805,10 +2036,24 @@ void CWriter::printInitializer(GlobalVariable *I) {
 }
 
 bool CWriter::doInitialization(Module &M) {
+  KernelFnCallees.clear();
+  InlinedCallees.clear();
+  NonInlinedCallees.clear();
+  kernelList.clear();
+  work_group_list.clear();
+  arg_addr_space_list.clear();
+  arg_access_qual_list.clear();
+  arg_type_list.clear();
+  arg_type_qual_list.clear();
+  arg_name_list.clear();
+  LaunchKernels.clear();
+
   FunctionPass::doInitialization(M);
 
   // Initialize
   TheModule = &M;
+  StringRef filename = llvm::sys::path::filename(M.getModuleIdentifier());
+  bcHash = filename.substr(0, filename.find("."));
 
   TD = new DataLayout(&M);
   IL = new IntrinsicLowering(*TD);
@@ -1836,7 +2081,8 @@ bool CWriter::doInitialization(Module &M) {
   for (Module::global_iterator I = M.global_begin(), E = M.global_end();
        I != E; ++I) {
     switch (getGlobalVariableClass(I)) {
-      default: break;
+      default:
+        break;
       case GlobalCtors:
         FindStaticTors(I, StaticCtors);
         break;
@@ -1852,6 +2098,24 @@ bool CWriter::doInitialization(Module &M) {
   Out << "#include <stdarg.h>\n";      // Varargs support
   Out << "#include <setjmp.h>\n";      // Unwind support
   Out << "#include <limits.h>\n";      // With overflow intrinsics support.
+#endif
+#ifdef MXPA_CODEGEN
+  Out << "\n#ifdef QUERIES\n";
+  Out << "#include <stdbool.h>\n";
+  Out << "static inline int mxpa_smin(int a, int b) { return a>b?b:a; }\n"
+      << "static inline int mxpa_smax(int a, int b) { return a>b?a:b; }\n"
+      << "static inline int mxpa__Z5mad24iii(int a, int b, int c) { return a * b + c; }\n"
+      << "#define get_global_id(x)   (__mxpa_local_id[(x)]+__mxpa_group_offset[(x)])\n"
+      << "#define get_global_size(x) (__mxpa_global_size[(x)])\n"
+      << "#define get_group_id(x) (__mxpa_group_id[(x)])\n"
+      << "#define get_local_id(x) (__mxpa_local_id[(x)])\n"
+      << "#define get_local_size(x) (__mxpa_local_size[(x)])\n"
+      << "#define get_global_offset(x) (__mxpa_global_offset[(x)])\n"
+      << "#define get_work_dim() (__mxpa_work_dim)\n"
+      << "#define get_num_groups(x) (__mxpa_global_size[(x)] / __mxpa_local_size[(x)])\n"
+      << "#define mxpa_get_num_groups(x) (global_size[(x)] / local_size[(x)])\n"
+      << "#define mxpa_get_global_size(x) global_size[x]\n";
+  Out << "#endif\n";
 #endif
   generateCompilerSpecificCode(Out, TD);
 
@@ -1958,7 +2222,9 @@ bool CWriter::doInitialization(Module &M) {
     if (I->hasExternalWeakLinkage()) {
       Out << "extern ";
     }
-    //printFunctionSignature(I, true);
+    if (CompileOpenCLKernel) {
+      printFunctionSignature(I, true);
+    }
     //if (I->hasWeakLinkage() || I->hasLinkOnceLinkage())
     //  Out << " __ATTRIBUTE_WEAK__";
     if (I->hasExternalWeakLinkage()) {
@@ -1978,7 +2244,9 @@ bool CWriter::doInitialization(Module &M) {
       Out << " LLVM_ASM(\"" << I->getName().substr(1) << "\")";
     }
 
-    //Out << ";\n";
+    if (CompileOpenCLKernel) {
+      Out << ";\n";
+    }
   }
 #if 0
   // Output the global variable declarations
@@ -2023,7 +2291,7 @@ bool CWriter::doInitialization(Module &M) {
   }
 #endif
   // Output the global variable definitions and contents...
-  if (!M.global_empty()) {
+  if (!M.global_empty() && CompileOpenCLKernel) {
     Out << "\n\n/* Global Variable Definitions and Initialization */\n";
     for (Module::global_iterator I = M.global_begin(), E = M.global_end();
          I != E; ++I)
@@ -2036,11 +2304,42 @@ bool CWriter::doInitialization(Module &M) {
         if (!I->isConstant()) {
           continue;
         }
+        if (isa<Constant>(I)) {
+          Out << "__constant ";
+          printType(Out, I->getType()->getElementType(), false,
 
-        Out << "__constant struct ";
-        printType(Out, I->getType()->getElementType(), false,
-                  GetValueName(I));
-        printInitializer(I);
+                    GetValueName(I));
+        } else {
+          Out << "__constant struct ";
+          printType(Out, I->getType()->getElementType(), false,
+                    GetValueName(I));
+        }
+        // If the initializer is not null, emit the initializer.  If it is null,
+        // we try to avoid emitting large amounts of zeros.  The problem with
+        // this, however, occurs when the variable has weak linkage.  In this
+        // case, the assembler will complain about the variable being both weak
+        // and common, so we disable this optimization.
+        // FIXME common linkage should avoid this problem.
+        if (I->hasInitializer() && !I->getInitializer()->isNullValue()) {
+          Out << " = " ;
+          writeOperand(I->getInitializer(), true);
+        } else if (I->hasWeakLinkage()) {
+          // We have to specify an initializer, but it doesn't have to be
+          // complete.  If the value is an aggregate, print out { 0 }, and let
+          // the compiler figure out the rest of the zeros.
+          Out << " = " ;
+          if (I->getInitializer()->getType()->isStructTy() ||
+              I->getInitializer()->getType()->isVectorTy()) {
+            Out << "{ 0 }";
+          } else if (I->getInitializer()->getType()->isArrayTy()) {
+            // As with structs and vectors, but with an extra set of braces
+            // because arrays are wrapped in structs.
+            Out << "{ { 0 } }";
+          } else {
+            // Just print it out normally.
+            writeOperand(I->getInitializer(), true);
+          }
+        }
         Out << ";\n";
       }
   }
@@ -2102,7 +2401,11 @@ void CWriter::printFloatingPointConstants(Function &F) {
   //
   for (constant_iterator I = constant_begin(&F), E = constant_end(&F);
        I != E; ++I) {
-    printFloatingPointConstants(*I);
+    if (const ConstantDataSequential *CDS = dyn_cast<ConstantDataSequential>(*I)) {
+      printFloatingPointConstantDataSequentials(CDS);
+    } else {
+      printFloatingPointConstants(*I);
+    }
   }
 
   //Out << '\n';
@@ -2161,6 +2464,12 @@ void CWriter::printFloatingPointConstants(const Constant *C) {
   }
 }
 
+void CWriter::printFloatingPointConstantDataSequentials(
+  const ConstantDataSequential *CDS) {
+  for (unsigned i = 0, e = CDS->getNumElements(); i != e; ++i) {
+    printFloatingPointConstants(CDS->getElementAsConstant(i));
+  }
+}
 
 /// printSymbolTable - Run through symbol table looking for type names.  If a
 /// type name is found, emit its declaration...
@@ -2278,6 +2587,113 @@ void CWriter::printContainedStructs(Type *Ty,
     Out << ";\n\n";
   }
 }
+
+bool CWriter::collectKernelInfo() {
+  NamedMDNode *openCLMetadata = TheModule->getNamedMetadata("opencl.kernels");
+  if (!openCLMetadata) {
+    return false;
+  }
+  unsigned kernelNum = openCLMetadata->getNumOperands();
+  for (unsigned K = 0, E = kernelNum; K != E; ++K) {
+    MDNode *kernelMD =  dyn_cast<MDNode>(openCLMetadata->getOperand(K));
+    // FIXME: The kernel is removed in kernel_*.cl.c.mxpa.bc. This is a work
+    //        around solution.
+    if (!kernelMD->getOperand(0)) {
+      continue;
+    }
+    Function *fun = dyn_cast<Function>(kernelMD->getOperand(0));
+    unsigned num_md = kernelMD->getNumOperands();
+    // Get number of metadata this kernel has
+    std::vector<std::string> arg_addr_space;
+    std::vector<std::string> arg_access_qual;
+    std::vector<std::string> arg_type;
+    std::vector<std::string> arg_type_qual;
+    std::vector<std::string> arg_name;
+    std::vector<unsigned int> workgroups(3, 0);
+    for (unsigned A = 1; A < num_md; ++A) {
+      MDNode *info_Nd = dyn_cast<MDNode>(kernelMD->getOperand(A));
+      std::string infoName = info_Nd->getOperand(0)->getName().str();
+      unsigned arg_num = info_Nd->getNumOperands();
+      if (infoName.compare("kernel_arg_addr_space") == 0) {
+        for (unsigned int i = 1; i < arg_num; ++i) {
+          std::string info = "";
+          ConstantInt *CI = dyn_cast<ConstantInt>(info_Nd->getOperand(i));
+          if (CI->equalsInt(0)) {
+            info = "0X119E";
+          } else if (CI->equalsInt(1)) {
+            info = "0X119B";
+          } else if (CI->equalsInt(2)) {
+            info = "0X119D";
+          } else if (CI->equalsInt(3)) {
+            info = "0X119C";
+          }
+          arg_addr_space.push_back(info);
+        }
+      } else if (infoName.compare("kernel_arg_access_qual") == 0) {
+        for (unsigned int i = 1; i < arg_num; ++i) {
+          std::string info = "";
+          StringRef SR = info_Nd->getOperand(i)->getName();
+          if (SR.equals("read only") || SR.equals("READ ONLY")) {
+            info = "0X11A0";
+          } else if (SR.equals("write only") || SR.equals("WRITE ONLY")) {
+            info = "0X11A1";
+          } else if (SR.equals("read write") || SR.equals("READ WRITE")) {
+            info = "0X11A2";
+          } else if (SR.equals("none") || SR.equals("NONE")) {
+            info = "0X11A3";
+          }
+          arg_access_qual.push_back(info);
+        }
+      } else if (infoName.compare("kernel_arg_type") == 0) {
+        for (unsigned int i = 1; i < arg_num; ++i) {
+          arg_type.push_back(info_Nd->getOperand(i)->getName());
+        }
+      } else if (infoName.compare("kernel_arg_type_qual") == 0) {
+        for (unsigned int i = 1; i < arg_num; ++i) {
+          std::string type_qual = info_Nd->getOperand(i)->getName();
+          unsigned int temp_val = 0;
+          if (type_qual.find("const") != std::string::npos) {
+            temp_val += 1;
+          }
+          if (type_qual.find("restrict") != std::string::npos) {
+            temp_val += 2;
+          }
+          if (type_qual.find("volatile") != std::string::npos) {
+            temp_val += 4;
+          }
+          std::stringstream ss;
+          ss << temp_val;
+          arg_type_qual.push_back(ss.str());
+        }
+      } else if (infoName.compare("kernel_arg_name") == 0) {
+        for (unsigned int i = 1; i < arg_num; ++i) {
+          arg_name.push_back(info_Nd->getOperand(i)->getName());
+        }
+      } else if (infoName.compare("reqd_work_group_size") == 0) {
+        ConstantInt *constfirst  = dyn_cast<ConstantInt>(info_Nd->getOperand(1));
+        ConstantInt *constsecond = dyn_cast<ConstantInt>(info_Nd->getOperand(2));
+        ConstantInt *constthird  = dyn_cast<ConstantInt>(info_Nd->getOperand(3));
+        // sext or zext?
+        unsigned int first = (unsigned int)constfirst->getZExtValue();
+        unsigned int second = (unsigned int)constsecond->getZExtValue();
+        unsigned int third = (unsigned int)constthird->getZExtValue();
+        workgroups.at(0) = first;
+        workgroups.at(1) = second;
+        workgroups.at(2) = third;
+        llvm::errs() << "workgroup: " << first << " " << second << " " << third << "\n";
+      }
+    } // end of loop
+    kernelList.push_back(fun->getName());
+    work_group_list.push_back(workgroups);
+    arg_addr_space_list.push_back(arg_addr_space);
+    arg_access_qual_list.push_back(arg_access_qual);
+    arg_type_list.push_back(arg_type);
+    arg_type_qual_list.push_back(arg_type_qual);
+    arg_name_list.push_back(arg_name);
+  }
+  return false;
+}
+
 bool CWriter::isKernelFunction(const Function *F) {
   if (!F) {
     return false;
@@ -2328,7 +2744,9 @@ void CWriter::printFunctionSignature(const Function *F, bool Prototype) {
   raw_string_ostream FunctionInnards(tstr);
 
   // Print out the name...
-  FunctionInnards << GetValueName(F) << '(';
+  // Split typen and its function signature. (e.g., char2vload2() ->
+  // char2 vload2())
+  FunctionInnards << " " << GetValueName(F) << '(';
 
   // Print the keyword of kernel
   if (isKernelFunction(F)) {
@@ -2629,6 +3047,565 @@ void  CWriter::printFunctionPrivateVaraibles(Function &F) {
     }
   }
 }
+
+#ifdef MXPA_CODEGEN
+void CWriter::printMXPAKernelRegister() {
+  collectKernelInfo();
+
+  if (kernelList.empty()) {
+    return;
+  }
+
+  std::vector<std::string>::iterator const it_end = kernelList.end();
+
+  Out << "#ifdef REGISTER_KERNEL\n";
+  // add prefix for launch_kernel() on myriad2
+  Out << "#ifdef REGISTER_KERNEL_SEPARATED\n"
+      "# define MK_KERNEL_NAME(name) MXPA_##name\n"
+      "#else\n"
+      "# define MK_KERNEL_NAME(name) name\n"
+      "#endif\n\n";
+
+  /* declare kernels if we did not generate kernel functions here */
+  for (std::vector<std::string>::iterator it = kernelList.begin();
+       it != it_end; ++it) {
+    Out << "/* " << *it << " */\n";
+    Out << "extern void MK_KERNEL_NAME(launch_kernel_" << bcHash << "_" << *it << ")(\n"
+        << "  unsigned *group_id, unsigned *global_size,\n"
+        << "  unsigned *local_size, unsigned *global_offset, unsigned work_dim, void const **arguments);\n\n";
+
+    Out << "extern int  MK_KERNEL_NAME(get_upper_" << bcHash << "_" << *it << ")(\n"
+        << "  unsigned arg_no, "
+        << "  unsigned *group_id, unsigned *global_size,\n"
+        << "  unsigned *local_size, unsigned *global_offset, unsigned work_dim, void const **arguments);\n\n";
+
+    Out << "extern int  MK_KERNEL_NAME(get_lower_" << bcHash << "_" << *it << ")(\n"
+        << "  unsigned arg_no, "
+        << "  unsigned *group_id, unsigned *global_size,\n"
+        << "  unsigned *local_size, unsigned *global_offset, unsigned work_dim, void const **arguments);\n\n";
+
+    Out << "extern int  MK_KERNEL_NAME(get_argument_dir_" << bcHash << "_" << *it << ")(unsigned arg_no);\n\n";
+
+    Out << "extern int  MK_KERNEL_NAME(get_argument_nr_" << bcHash << "_" << *it << ")(void);\n\n";
+  }
+
+  // print arguments for each kernel
+  for (size_t i = 0; i < kernelList.size(); i++) {
+    const std::string &krnlName = kernelList[i];
+
+    Out << "static const opencl_kernel_arg_info arg_info_" << krnlName << "[] = {\n";
+    unsigned arg_number = arg_addr_space_list[i].size();
+    for (unsigned arg_N = 0; arg_N < arg_number; ++arg_N) {
+      Out << "{"
+          << (arg_addr_space_list[i]).at(arg_N) << ", "
+          << (arg_access_qual_list[i]).at(arg_N) << ", "
+          << "\"" << (arg_type_list[i]).at(arg_N) << "\", "
+          << (arg_type_qual_list[i]).at(arg_N) << ", "
+          << "\"" << (arg_name_list[i]).at(arg_N) << "\""
+          << "}";
+      if (arg_N + 1 == arg_number) {
+        Out << "\n";
+      } else {
+        Out << ",\n";
+      }
+    }
+    Out << "};\n\n";
+  }
+
+  // print kernels of current program
+  Out << "static const opencl_kernel_descriptor prog_" << bcHash << "[] = {\n";
+
+  for (size_t i = 0; i < kernelList.size(); i++) {
+    const std::string &krnlName = kernelList[i];
+    Out << "{\n"
+        << "\"" << bcHash << "\",\n"
+        << "\"" << krnlName << "\",\n"
+        << "MK_KERNEL_NAME(launch_kernel_" << bcHash << "_" << krnlName << "),\n"
+        << "{ get_upper_" << bcHash << "_" << krnlName << ", "
+        << "MK_KERNEL_NAME(get_upper_" << bcHash << "_" << krnlName << ") },\n"
+        << "{ get_lower_" << bcHash << "_" << krnlName << ", "
+        << "MK_KERNEL_NAME(get_lower_" << bcHash << "_" << krnlName << ") },\n"
+        << "{ get_argument_dir_" << bcHash << "_" << krnlName << ", "
+        << "MK_KERNEL_NAME(get_argument_dir_" << bcHash << "_" << krnlName << ") },\n"
+        << "{ get_argument_nr_" << bcHash << "_" << krnlName << ", "
+        << "MK_KERNEL_NAME(get_argument_nr_" << bcHash << "_" << krnlName << ") },\n"
+        << "{" << work_group_list[i].at(0) << "," << work_group_list[i].at(1) << "," <<  work_group_list[i].at(2) << "},\n"
+        << "arg_info_" << krnlName << "}";
+
+    if (i + 1 == kernelList.size()) {
+      Out << "\n";
+    } else {
+      Out << ",\n";
+    }
+  }
+
+  Out << "};\n\n";
+
+  Out << "#undef MK_KERNEL_NAME\n";
+
+  // register program by constructor
+  Out << "static void __attribute__((constructor)) __mxpa_register_me_"
+      << bcHash << "() {\n";
+
+  Out << "  reg_krldes_func(" << kernelList.size() << ", (opencl_kernel_descriptor *)prog_" << bcHash << ");\n";
+
+  Out << "}\n"
+      << "#endif\n\n";
+}
+
+void CWriter::printMXPAWrapper(Function &F) {
+  assert(isKernelFunction(&F));
+  assert(!F.hasStructRetAttr());
+  Out << "#if defined(__unix__) || defined(__unix) || (defined(__APPLE__) && defined(__MACH__))\n";
+  Out << "#define MXPA_NOEXIT 1\n";
+  Out << "#endif\n";
+
+  Out << "static void launch_kernel_" << GetValueName(&F) << '(';
+  Out << "unsigned *group_id, unsigned *global_size,\n"
+      "  unsigned *local_size, unsigned *global_offset, unsigned work_dim, void const **arguments) {\n";
+
+  // Prepare the call to kernel
+  std::string tstr;
+  raw_string_ostream FunctionInnards(tstr);
+
+  // Loop over the arguments, printing them...
+  FunctionType *FT = cast<FunctionType>(F.getFunctionType());
+  const AttributeSet &PAL = F.getAttributes();
+
+  // Print out the kernel name and first few MxPA arguments
+  Out << "  " << GetValueName(&F) << "(group_id, global_size, local_size, global_offset, work_dim, ";
+
+  // Loop over the arguments, printing them.
+  FunctionType::param_iterator I = FT->param_begin(), E = FT->param_end();
+  unsigned Idx = 0;
+  for (; I != E; ++I) {
+    Type *ArgTy = *I;
+
+    Out << ",\n    (";
+    printType(Out, ArgTy, PAL.hasAttribute(Idx, Attribute::SExt));
+    Out << ")";
+    if (ArgTy->getTypeID() == Type::PointerTyID || ArgTy->getTypeID() == Type::ArrayTyID) {
+      Out << " ((uintptr_t)arguments[" << Idx << "])";
+    } else {
+      Out << " *((";
+      printType(Out, ArgTy, PAL.hasAttribute(Idx, Attribute::SExt));
+      Out << "*)arguments[" << Idx << "])";
+    }
+
+    ++Idx;
+  }
+  Out << ");\n";
+  Out << "#ifndef MXPA_NOEXIT\n  exit(0);\n#endif\n";
+  Out << "}\n";
+}
+
+namespace {
+static Value *GetSCEVBase(ScalarEvolution *SE, const SCEV *scev);
+static bool isInnerArgument(Value *V);
+}
+
+/// NeedHndlMXPAForSlctInst - Detect if the Value '*V' has been stored in
+/// MemoryAcesses. It also decide whether the value should be processed
+/// separately or processed as a common case.
+bool CWriter::NeedHndlMXPAForSlctInst(Value *V) {
+  Argument *arg = dyn_cast<Argument>(V);
+  if (!arg) {
+    return false;
+  }
+
+  std::map<Value *, std::set<const SCEV *> >::iterator
+  I = MemoryAccesses.find(V);
+
+  if (I != MemoryAccesses.end()) {
+    return false;
+  }
+  return true;
+}
+
+/// hndlMXPAArgForSlctInst - Handle one operand of a select instruction
+/// separately. It regards the operand as a part of a *virtual* load
+/// instruction. Consider the case :
+///
+///     "%z.y = select i1 %cmp, float* %z, float* %y"
+///
+/// It can be regarded as two *virtual* load instructions like :
+///
+///     "%z.y = load float* %z, align 4" and "%z.y = load float* %y, align 4"
+///
+/// The two *virtual* load instructions are only used for MXPA QUERY.
+void CWriter::hndlMXPAArgForSlctInst(Value *V) {
+  if (!NeedHndlMXPAForSlctInst(V)) {
+    return;
+  }
+  printMXPAArgForSlctInst(V);
+}
+
+/// printMXPAArgForSlctInst - Print the MXPA argument query information for
+/// a operand of a select instruction.
+void CWriter::printMXPAArgForSlctInst(Value *V) {
+  Argument *arg = dyn_cast<Argument>(V);
+  if (!arg) {
+    return;
+  }
+  Out << "    case " << arg->getArgNo() << ": { //";
+  writeOperand(V);
+  Out << "\n";
+
+  const SCEV *scev = SE->getSCEV(V);
+  Value *v = GetSCEVBase(SE, scev);
+
+  if (v) {
+    if (MemoryWrites.find(scev) != MemoryWrites.end()) {
+      Out << "         return 1;\n";
+    } else {
+      Out << "         return 0;\n";
+    }
+    Out << "         }\n";
+  }
+}
+
+/// printMXPAArgCommCase - Print the MXPA argument information for *common*
+/// case.
+void CWriter::printMXPAArgCommCase(
+  std::map<Value *, std::set<const SCEV *> >::iterator &it) {
+  Value *ptr = it->first;
+  if (Argument *arg = dyn_cast<Argument>(ptr)) {
+    Out << "    case " << arg->getArgNo() << ": { //";
+    writeOperand(ptr);
+    Out << "\n";
+    std::set<const SCEV *> scevs = it->second;
+    int rtVal = 3;
+    for (std::set<const SCEV *>::iterator sit = scevs.begin(), se =
+           scevs.end(); sit != se; sit++) {
+      const SCEV *s = *sit;
+      if (MemoryWrites.find(s) != MemoryWrites.end()) {
+        if (rtVal == 0) {
+          rtVal = 3;
+          break;
+        }
+        rtVal = 1;
+      } else {
+        if (rtVal == 1) {
+          rtVal = 3;
+          break;
+        }
+        rtVal = 0;
+      }
+    }
+    Out << "         return " << rtVal << ";\n";
+    Out << "         }\n";
+  }
+}
+
+void CWriter::printMXPAArgQueries(Function &F) {
+  assert(isKernelFunction(&F));
+  assert(!F.hasStructRetAttr());
+  //const AttributeSet &PAL = F.getAttributes();
+
+  // Generate argument # query
+  Out << "\nint get_argument_nr_" << bcHash << "_" << GetValueName(&F) << "(void) {\n  return ";
+  Out << F.arg_size() << ";\n}\n";
+
+  // Generate argument direction queries
+  Out << "\nint get_argument_dir_" << bcHash << "_" << GetValueName(&F) << "(unsigned arg_no) {\n";
+  Out << "  switch(arg_no) {\n";
+  typedef std::map<Value *, std::set<const SCEV *> > Scevs;
+  for (Scevs::iterator it = MemoryAccesses.begin(), e = MemoryAccesses.end();
+       it != e; it++) {
+    Value *ptr = it->first;
+    if (isa<Constant>(ptr)) {
+      continue;  // Constant may be included
+    }
+    if (SelectInst *slc = dyn_cast<SelectInst>(ptr)) {
+      Value *trueV = slc->getTrueValue();
+      hndlMXPAArgForSlctInst(trueV);
+      Value *falseV = slc->getFalseValue();
+      hndlMXPAArgForSlctInst(falseV);
+      continue;
+    }
+    if (PHINode *phi = dyn_cast<PHINode>(ptr)) {
+      int numValues = phi->getNumIncomingValues();
+      for (int i = 0; i < numValues; ++i) {
+        Value *v = phi->getIncomingValue(i);
+        hndlMXPAArgForSlctInst(v);
+      }
+      continue;
+    }
+    if (isInnerArgument(ptr)) {
+      continue;
+    }
+    printMXPAArgCommCase(it);
+    Out << "\n";
+  }
+  Out << "  };\nreturn 2;\n}\n\n";
+}
+
+namespace {
+std::string corners(unsigned g1) {
+  std::string s = "#undef mxpa_get_global_id\n#define mxpa_get_global_id(x)";
+  if (g1) {
+    s += " (group_id[x]*local_size[x]+local_size[x]-1)";
+  } else {
+    s += " (group_id[x]*local_size[x])";
+  }
+  s += "\n";
+
+  s += "#undef mxpa_get_group_id\n#define mxpa_get_group_id(x)";
+  s += " (group_id[x])";
+  s += "\n";
+
+  s += "#undef mxpa_get_local_size\n#define mxpa_get_local_size(x)";
+  s += " (local_size[x])";
+  s += "\n";
+
+  s += "#undef mxpa_get_local_id\n#define mxpa_get_local_id(x)";
+  if (g1) {
+    s += " (local_size[x]-1)";
+  } else {
+    s += " (0)";
+  }
+  s += "\n";
+  return s;
+}
+}
+
+/// hndlMXPABndsForSlctInst - Handle one operand of a select instruction
+/// separately. It regards the operand as a part of a *virtual* load
+/// instruction.
+void CWriter::hndlMXPABndsForSlctInst(Value *V, bool Upper) {
+  if (!NeedHndlMXPAForSlctInst(V)) {
+    return;
+  }
+  printMXPABndsForSlctInst(V, Upper);
+}
+
+/// printMXPABndsForSlctInst - Print the MXPA bound information for a operand
+/// of a select instruction.
+void CWriter::printMXPABndsForSlctInst(Value *V, bool Upper) {
+  Argument *arg = dyn_cast<Argument>(V);
+  if (!arg) {
+    return;
+  }
+  Out << "    case " << arg->getArgNo() << ": { //";
+  writeOperand(V);
+  Out << "\n";
+  if (Upper) {
+    Out << "         int b = 0;\n";
+  } else {
+    Out << "         int b = INT_MAX;\n";
+  }
+
+  const SCEV *scev = SE->getSCEV(V);
+  Value *vBase = GetSCEVBase(SE, scev);
+  if (vBase) {
+    for (Value::user_iterator ui = V->user_begin(),
+         ue = V->user_end(); ui != ue; ui++) {
+      Value *uv = *ui;
+      if (Instruction *I = dyn_cast<Instruction>(uv)) {
+        if (I->mayWriteToMemory()) {
+          MemoryWrites.insert(scev);
+        }
+      }
+    }
+  } else {
+    errs() << "CWriter: Cannot locate the base of a memory access. Upper/lower "
+           "bound analysis may be inaccurate\n";
+  }
+
+  for (unsigned i = 0; i < 2; i++) {
+    Out << corners(i);
+    if (Upper) {
+      Out << "         b = mxpa_smax(b, ";
+    } else {
+      Out << "         b = mxpa_smin(b, ";
+    }
+    writeBounds(scev, Upper, V);
+    Out << ");\n";
+  }
+
+  // Upper bounds are exclusive
+  if (Upper) {
+    int elesize = TD->getTypeStoreSize(arg->getType()->getPointerElementType());
+    if (MemoryElementSize[V] != NULL) {
+      if (SCEVConstant *s = dyn_cast<SCEVConstant>((SCEV *)MemoryElementSize[V])) {
+        elesize = std::max((int)((ConstantInt *)(s->getValue()))->getZExtValue(), elesize);
+      }
+    }
+
+    Out << "         b+= "
+        << elesize
+        << ";\n";
+  };
+  Out << "         return b;\n";
+  Out << "         }\n";
+}
+
+/// printMXPABndsCommCase - Print the MXPA bound information for *common* case.
+void CWriter::printMXPABndsCommCase(
+  std::map<Value *, std::set<const SCEV *> >::iterator &it,
+  bool Upper) {
+  Value *ptr = it->first;
+  if (Argument *arg = dyn_cast<Argument>(ptr)) {
+    Out << "    case " << arg->getArgNo() << ": { //";
+    writeOperand(ptr);
+    Out << "\n";
+    std::set<const SCEV *> scevs = it->second;
+    std::set<const SCEV *>::iterator sit = scevs.begin();
+    std::set<const SCEV *>::iterator se = scevs.end();
+    char ret = 0;
+    for (; sit != se; sit++) {
+      ret = 0;
+      CheckBounds(*sit, Upper, ret);
+      if (ret & 1) {
+        Out << "         return -1;\n";
+        Out << "         }\n";
+        return;
+      } else if ((ret & 1) == 0 && (ret & 2) == 2) {
+        Out << "    #ifndef INDIRECTION\n";
+        Out << "         return -1;\n";
+        Out << "    #else\n";
+        break;
+      }
+    }
+
+    if (Upper) {
+      Out << "         int b = 0;\n";
+    } else {
+      Out << "         int b = INT_MAX;\n";
+    }
+    for (sit = scevs.begin(), se = scevs.end(); sit != se; sit++) {
+      for (unsigned i = 0; i < 2; i++) {
+        Out << corners(i);
+        if (Upper) {
+          Out << "         b = mxpa_smax(b, ";
+        } else {
+          Out << "         b = mxpa_smin(b, ";
+        }
+        writeBounds(*sit, Upper, ptr);
+        Out << ");\n";
+      }
+    }
+    // Upper bounds are exclusive
+    if (Upper) {
+      int elesize = TD->getTypeStoreSize(arg->getType()->getPointerElementType());
+      if (SCEVConstant *s = dyn_cast<SCEVConstant>((SCEV *)MemoryElementSize[ptr])) {
+        elesize = std::max((int)((ConstantInt *)(s->getValue()))->getZExtValue(), elesize);
+      }
+
+      Out << "         b+= "
+          << elesize
+          << ";\n";
+    };
+    Out << "         return b;\n";
+
+    if ((ret & 1) == 0 && (ret & 2) == 2) {
+      Out << "    #endif\n";
+    }
+
+    Out << "         }\n";
+  }
+}
+
+
+// Textually synthesize kernel bound query functions
+void CWriter::printMXPABounds(Function &F, bool Upper) {
+  assert(isKernelFunction(&F));
+  assert(!F.hasStructRetAttr());
+  // Upper/lower bound routines
+  const AttributeSet &PAL = F.getAttributes();
+
+  // Print out the kernel name and first few MxPA arguments
+  Out << "\nint get_" << (Upper ? "upper" : "lower") << "_" << bcHash << "_" << GetValueName(&F) << "(";
+  Out << "unsigned arg_no, unsigned *group_id, unsigned *global_size, unsigned *local_size, unsigned *global_offset, unsigned work_dim, "
+      "void const **arguments) {\n";
+
+  // Loop over the arguments, printing them.
+  Function::const_arg_iterator I = F.arg_begin(), E = F.arg_end();
+  unsigned Idx = 0;
+
+  std::string ArgName;
+  for (; I != E; ++I) {
+    ArgName = GetValueName(I);
+    Type *ArgTy = I->getType();
+
+    Out << "  ";
+    printType(Out, ArgTy, PAL.hasAttribute(Idx, Attribute::SExt), ArgName);
+    Out << "= (";
+    printType(Out, ArgTy, PAL.hasAttribute(Idx, Attribute::SExt));
+    Out << ")";
+    if (ArgTy->getTypeID() == Type::PointerTyID || ArgTy->getTypeID() == Type::ArrayTyID) {
+      Out << " ((uintptr_t)arguments[" << Idx << "]);\n";
+    } else {
+      Out << " *((";
+      printType(Out, ArgTy, PAL.hasAttribute(Idx, Attribute::SExt));
+      Out << "*)arguments[" << Idx << "]);\n";
+    }
+    ++Idx;
+  }
+
+  Out << "  switch(arg_no) {\n";
+  typedef std::map<Value *, std::set<const SCEV *> > Scevs;
+
+  for (Scevs::iterator it = MemoryAccesses.begin(), e = MemoryAccesses.end();
+       it != e; it++) {
+    Value *ptr = it->first;
+    if (isa<Constant>(ptr)) {
+      continue;  // Constant may be included
+    }
+    if (SelectInst *slc = dyn_cast<SelectInst>(ptr)) {
+      Value *trueV = slc->getTrueValue();
+      hndlMXPABndsForSlctInst(trueV, Upper);
+
+      Value *falseV = slc->getFalseValue();
+      hndlMXPABndsForSlctInst(falseV, Upper);
+      continue;
+    }
+    if (PHINode *phi = dyn_cast<PHINode>(ptr)) {
+      int numValues = phi->getNumIncomingValues();
+      for (int i = 0; i < numValues; ++i) {
+        Value *v = phi->getIncomingValue(i);
+        hndlMXPABndsForSlctInst(v, Upper);
+      }
+      continue;
+    }
+    if (isInnerArgument(ptr)) {
+      continue;
+    }
+    printMXPABndsCommCase(it, Upper);
+    Out << "\n";
+  }
+  Out << "  };\nreturn 0;\n}";
+}
+
+/// isUselessFunction - Figure out the functions that needn't to generate code.
+/// Two cases are considered: (1) The functions are inlined in the kernel
+/// functions, and (2) The functions are called in kernel functions but are not
+/// lineable.
+bool CWriter::isUselessFunction(Function &F) {
+  if (isKernelFunction(&F)) {
+    return false;
+  }
+
+  if (isLaunchKernel(F)) {
+    return false;
+  }
+
+  if (NonInlinedCallees.find(&F) != NonInlinedCallees.end()) {
+    return true;
+  }
+
+  if (InlinedCallees.find(&F) != InlinedCallees.end()) {
+    return true;
+  }
+
+  return false;
+}
+
+bool CWriter::isLaunchKernel(const Function &F) {
+  return LaunchKernels.find(&F) != LaunchKernels.end();
+}
+
+#endif // MXPA_CODEGEN
 
 void CWriter::printFunction(Function &F) {
   /// isStructReturn - Should this function actually return a struct by-value?
@@ -2984,23 +3961,43 @@ void CWriter::visitBinaryOperator(Instruction &I) {
 
     switch (I.getOpcode()) {
       case Instruction::Add:
-      case Instruction::FAdd: Out << " + "; break;
+      case Instruction::FAdd:
+        Out << " + ";
+        break;
       case Instruction::Sub:
-      case Instruction::FSub: Out << " - "; break;
+      case Instruction::FSub:
+        Out << " - ";
+        break;
       case Instruction::Mul:
-      case Instruction::FMul: Out << " * "; break;
+      case Instruction::FMul:
+        Out << " * ";
+        break;
       case Instruction::URem:
       case Instruction::SRem:
-      case Instruction::FRem: Out << " % "; break;
+      case Instruction::FRem:
+        Out << " % ";
+        break;
       case Instruction::UDiv:
       case Instruction::SDiv:
-      case Instruction::FDiv: Out << " / "; break;
-      case Instruction::And:  Out << " & "; break;
-      case Instruction::Or:   Out << " | "; break;
-      case Instruction::Xor:  Out << " ^ "; break;
-      case Instruction::Shl : Out << " << "; break;
+      case Instruction::FDiv:
+        Out << " / ";
+        break;
+      case Instruction::And:
+        Out << " & ";
+        break;
+      case Instruction::Or:
+        Out << " | ";
+        break;
+      case Instruction::Xor:
+        Out << " ^ ";
+        break;
+      case Instruction::Shl :
+        Out << " << ";
+        break;
       case Instruction::LShr:
-      case Instruction::AShr: Out << " >> "; break;
+      case Instruction::AShr:
+        Out << " >> ";
+        break;
       default:
 #ifndef NDEBUG
         errs() << "Invalid operator type!" << I;
@@ -3033,16 +4030,28 @@ void CWriter::visitICmpInst(ICmpInst &I) {
   writeOperandWithCast(I.getOperand(0), I);
 
   switch (I.getPredicate()) {
-    case ICmpInst::ICMP_EQ:  Out << " == "; break;
-    case ICmpInst::ICMP_NE:  Out << " != "; break;
+    case ICmpInst::ICMP_EQ:
+      Out << " == ";
+      break;
+    case ICmpInst::ICMP_NE:
+      Out << " != ";
+      break;
     case ICmpInst::ICMP_ULE:
-    case ICmpInst::ICMP_SLE: Out << " <= "; break;
+    case ICmpInst::ICMP_SLE:
+      Out << " <= ";
+      break;
     case ICmpInst::ICMP_UGE:
-    case ICmpInst::ICMP_SGE: Out << " >= "; break;
+    case ICmpInst::ICMP_SGE:
+      Out << " >= ";
+      break;
     case ICmpInst::ICMP_ULT:
-    case ICmpInst::ICMP_SLT: Out << " < "; break;
+    case ICmpInst::ICMP_SLT:
+      Out << " < ";
+      break;
     case ICmpInst::ICMP_UGT:
-    case ICmpInst::ICMP_SGT: Out << " > "; break;
+    case ICmpInst::ICMP_SGT:
+      Out << " > ";
+      break;
     default:
 #ifndef NDEBUG
       errs() << "Invalid icmp predicate!" << I;
@@ -3072,21 +4081,50 @@ void CWriter::visitFCmpInst(FCmpInst &I) {
 
   const char *op = 0;
   switch (I.getPredicate()) {
-    default: llvm_unreachable("Illegal FCmp predicate");
-    case FCmpInst::FCMP_ORD: op = "ord"; break;
-    case FCmpInst::FCMP_UNO: op = "uno"; break;
-    case FCmpInst::FCMP_UEQ: op = "ueq"; break;
-    case FCmpInst::FCMP_UNE: op = "une"; break;
-    case FCmpInst::FCMP_ULT: op = "ult"; break;
-    case FCmpInst::FCMP_ULE: op = "ule"; break;
-    case FCmpInst::FCMP_UGT: op = "ugt"; break;
-    case FCmpInst::FCMP_UGE: op = "uge"; break;
-    case FCmpInst::FCMP_OEQ: op = "oeq"; break;
-    case FCmpInst::FCMP_ONE: op = "one"; break;
-    case FCmpInst::FCMP_OLT: op = "olt"; break;
-    case FCmpInst::FCMP_OLE: op = "ole"; break;
-    case FCmpInst::FCMP_OGT: op = "ogt"; break;
-    case FCmpInst::FCMP_OGE: op = "oge"; break;
+    default:
+      llvm_unreachable("Illegal FCmp predicate");
+    case FCmpInst::FCMP_ORD:
+      op = "ord";
+      break;
+    case FCmpInst::FCMP_UNO:
+      op = "uno";
+      break;
+    case FCmpInst::FCMP_UEQ:
+      op = "ueq";
+      break;
+    case FCmpInst::FCMP_UNE:
+      op = "une";
+      break;
+    case FCmpInst::FCMP_ULT:
+      op = "ult";
+      break;
+    case FCmpInst::FCMP_ULE:
+      op = "ule";
+      break;
+    case FCmpInst::FCMP_UGT:
+      op = "ugt";
+      break;
+    case FCmpInst::FCMP_UGE:
+      op = "uge";
+      break;
+    case FCmpInst::FCMP_OEQ:
+      op = "oeq";
+      break;
+    case FCmpInst::FCMP_ONE:
+      op = "one";
+      break;
+    case FCmpInst::FCMP_OLT:
+      op = "olt";
+      break;
+    case FCmpInst::FCMP_OLE:
+      op = "ole";
+      break;
+    case FCmpInst::FCMP_OGT:
+      op = "ogt";
+      break;
+    case FCmpInst::FCMP_OGE:
+      op = "oge";
+      break;
   }
 
   Out << "llvm_fcmp_" << op << "(";
@@ -3100,9 +4138,12 @@ void CWriter::visitFCmpInst(FCmpInst &I) {
 
 static const char *getFloatBitCastField(Type *Ty) {
   switch (Ty->getTypeID()) {
-    default: llvm_unreachable("Invalid Type");
-    case Type::FloatTyID:  return "Float";
-    case Type::DoubleTyID: return "Double";
+    default:
+      llvm_unreachable("Invalid Type");
+    case Type::FloatTyID:
+      return "Float";
+    case Type::DoubleTyID:
+      return "Double";
     case Type::IntegerTyID: {
         unsigned NumBits = cast<IntegerType>(Ty)->getBitWidth();
         if (NumBits <= 32) {
@@ -3127,6 +4168,12 @@ void CWriter::visitCastInst(CastInst &I) {
         << getFloatBitCastField(I.getType());
     Out << ')';
     return;
+  }
+  if (SrcTy->getTypeID() == Type::IntegerTyID) {
+    unsigned NumBits = cast<IntegerType>(SrcTy)->getBitWidth();
+    if (NumBits == 128) {
+      Out << '*';
+    }
   }
 
   bool ShouldCast = true;
@@ -3291,6 +4338,7 @@ void CWriter::lowerIntrinsics(Function &F) {
             case Intrinsic::returnaddress:
             case Intrinsic::frameaddress:
             case Intrinsic::setjmp:
+            case Intrinsic::fmuladd:
             case Intrinsic::longjmp:
             case Intrinsic::prefetch:
             case Intrinsic::powi:
@@ -3320,7 +4368,8 @@ void CWriter::lowerIntrinsics(Function &F) {
 
               IL->LowerIntrinsicCall(CI);
               if (Before) {        // Move iterator to instruction after call
-                I = Before; ++I;
+                I = Before;
+                ++I;
               } else {
                 I = BB->begin();
               }
@@ -3528,6 +4577,15 @@ bool CWriter::visitBuiltinCall(CallInst &I, Intrinsic::ID ID,
         Out << "va_end(*(va_list*)0)";
       }
       return true;
+    case Intrinsic::fmuladd:
+      Out << "(";
+      writeOperand(I.getArgOperand(0));
+      Out << " * ";
+      writeOperand(I.getArgOperand(1));
+      Out << " + ";
+      writeOperand(I.getArgOperand(2));
+      Out << ')';
+      return true;
     case Intrinsic::vacopy:
       Out << "0; ";
       Out << "va_copy(*(va_list*)";
@@ -3589,15 +4647,32 @@ bool CWriter::visitBuiltinCall(CallInst &I, Intrinsic::ID ID,
       Out << ')';
       // Multiple GCC builtins multiplex onto this intrinsic.
       switch (cast<ConstantInt>(I.getArgOperand(2))->getZExtValue()) {
-        default: llvm_unreachable("Invalid llvm.x86.sse.cmp!");
-        case 0: Out << "__builtin_ia32_cmpeq"; break;
-        case 1: Out << "__builtin_ia32_cmplt"; break;
-        case 2: Out << "__builtin_ia32_cmple"; break;
-        case 3: Out << "__builtin_ia32_cmpunord"; break;
-        case 4: Out << "__builtin_ia32_cmpneq"; break;
-        case 5: Out << "__builtin_ia32_cmpnlt"; break;
-        case 6: Out << "__builtin_ia32_cmpnle"; break;
-        case 7: Out << "__builtin_ia32_cmpord"; break;
+        default:
+          llvm_unreachable("Invalid llvm.x86.sse.cmp!");
+        case 0:
+          Out << "__builtin_ia32_cmpeq";
+          break;
+        case 1:
+          Out << "__builtin_ia32_cmplt";
+          break;
+        case 2:
+          Out << "__builtin_ia32_cmple";
+          break;
+        case 3:
+          Out << "__builtin_ia32_cmpunord";
+          break;
+        case 4:
+          Out << "__builtin_ia32_cmpneq";
+          break;
+        case 5:
+          Out << "__builtin_ia32_cmpnlt";
+          break;
+        case 6:
+          Out << "__builtin_ia32_cmpnle";
+          break;
+        case 7:
+          Out << "__builtin_ia32_cmpord";
+          break;
       }
       if (ID == Intrinsic::x86_sse_cmp_ps || ID == Intrinsic::x86_sse2_cmp_pd) {
         Out << 'p';
@@ -3942,9 +5017,435 @@ void CWriter::printGEPExpression(Value *Ptr, gep_type_iterator I,
   }
   Out << ")";
 }
+#ifdef MXPA_CODEGEN
 
+void CWriter::writeLoadInst(llvm::Value *Operand, llvm::Type *OperandType,
+                            bool IsVolatile, unsigned Alignment, bool isUpperBound, Value *arg) {
+  bool IsUnaligned = Alignment &&
+                     Alignment < TD->getABITypeAlignment(OperandType);
+
+  if (!IsUnaligned) {
+    Out << '*';
+    Out << '(';
+    printType(Out, OperandType);
+    Out << "*)";
+  }
+  if (IsVolatile || IsUnaligned) {
+    Out << "((";
+    if (IsUnaligned) {
+      Out << "struct __attribute__ ((packed, aligned(" << Alignment << "))) {";
+    }
+    printType(Out, OperandType, false, IsUnaligned ? "data" : "volatile*");
+    if (IsUnaligned) {
+      Out << "; } ";
+      if (IsVolatile) {
+        Out << "volatile ";
+      }
+      Out << "*";
+    }
+    Out << ")";
+  }
+
+  bool isAddressImplicit = isAddressExposed(Operand);
+  if (isAddressImplicit) {
+    Out << "(&";  // Global variables are referenced as their addresses by llvm
+  }
+
+
+  {
+    bool flag = true;
+    if (Instruction *I = dyn_cast<Instruction>(Operand)) {
+      // Should we inline this instruction to build a tree?
+      if (isInlinableInst(*I) && !isDirectAlloca(I)) {
+        Out << '(';
+        //      writeInstComputationInline(*I);
+        writeBounds(SE->getSCEV(Operand), isUpperBound, arg);
+        Out << ')';
+        flag = false;
+      }
+    }
+
+    if (flag) {
+      Constant *CPV = dyn_cast<Constant>(Operand);
+
+      if (CPV && !isa<GlobalValue>(CPV)) {
+        printConstant(CPV, false);
+      } else {
+        Out << GetValueName(Operand);
+      }
+    }
+  }
+
+  if (isAddressImplicit) {
+    Out << ')';
+  }
+
+  if (IsVolatile || IsUnaligned) {
+    Out << ')';
+    if (IsUnaligned) {
+      Out << "->data";
+    }
+  }
+}
+
+
+// In bound extraction, there are only two kinds of unknowns allowed:
+// 1) calls to get_{global/local}_ids
+void CWriter::writeBoundsUnknown(Value *v, bool isUpperBound, Value *arg) {
+  if (CallInst *CI = dyn_cast<CallInst>(v)) {
+    Out << "mxpa_";
+    writeOperand(CI->getCalledValue());
+    Out << '(';
+    CallSite CS(CI);
+    CallSite::arg_iterator AI = CS.arg_begin(), AE = CS.arg_end();
+    unsigned ArgNo = 0;
+    bool PrintedArg = false;
+    for (; AI != AE; ++AI, ++ArgNo) {
+      if (PrintedArg) {
+        Out << ", ";
+      }
+      const SCEV *scev = SE->getSCEV(*AI);
+      writeBounds(scev, isUpperBound, arg);
+      PrintedArg = true;
+    }
+    Out << ')';
+  } else if (LoadInst *I = dyn_cast<LoadInst>(v)) {
+    writeLoadInst(I->getOperand(0), I->getType(), I->isVolatile(),
+                  I->getAlignment(), isUpperBound, arg);
+  } else if (SDivOperator *CI = dyn_cast<SDivOperator>(v)) {
+    Out << "(";
+    writeBounds(SE->getSCEV(CI->getOperand(0)), isUpperBound, arg);
+    Out << " / ";
+    writeBounds(SE->getSCEV(CI->getOperand(1)), isUpperBound, arg);
+    Out << ")";
+  } else if (Instruction *I = dyn_cast<Instruction>(v)) {
+    visit(*I);
+  } else {
+    if (v->getName()  == arg->getName()) {
+      Out << "0U";
+    } else if (v->getType()->isPointerTy()) {
+      Out << "(unsigned char *)(";
+      writeOperand(v);
+      Out << ")";
+    } else {
+      writeOperand(v);
+    }
+  }
+}
+
+void CWriter::writeBounds(const SCEV *scev, bool isUpperBound, Value *arg) {
+  switch (scev->getSCEVType()) {
+    case scConstant: {
+        scev->print(Out);
+        break;
+      }
+    case scTruncate: {
+        Out << "(";
+        const SCEVTruncateExpr *Trunc = cast<SCEVTruncateExpr>(scev);
+        const SCEV *op = Trunc->getOperand();
+        writeBounds(op, isUpperBound, arg);
+        Out << ")";
+        break;
+      }
+    case scZeroExtend: {
+        Out << "(";
+        const SCEVZeroExtendExpr *A = cast<SCEVZeroExtendExpr>(scev);
+        const SCEV *op = A->getOperand();
+        writeBounds(op, isUpperBound, arg);
+        Out << ")";
+        break;
+      }
+    case scSignExtend: {
+        const SCEVSignExtendExpr *SExt = cast<SCEVSignExtendExpr>(scev);
+        const SCEV *op = SExt->getOperand();
+        writeBounds(op, isUpperBound, arg);
+        break;
+      }
+    case scAddExpr: {
+        const SCEVAddExpr *A = cast<SCEVAddExpr>(scev);
+        Out << "(";
+        for (size_t i = 0; i < A->getNumOperands(); i++) {
+          if (i) {
+            Out << " + ";
+          }
+          const SCEV *op = A->getOperand(i);
+          writeBounds(op, isUpperBound, arg);
+        }
+        Out << ")";
+        break;
+      }
+    case scMulExpr: {
+        const SCEVMulExpr *M = cast<SCEVMulExpr>(scev);
+        Out << "(";
+        for (size_t i = 0; i < M->getNumOperands(); i++) {
+          if (i) {
+            Out << " * ";
+          }
+          const SCEV *op = M->getOperand(i);
+          writeBounds(op, isUpperBound, arg);
+        }
+        Out << ")";
+        break;
+      }
+    case scUDivExpr: {
+        const SCEVUDivExpr *UD = cast<SCEVUDivExpr>(scev);
+        Out << "(";
+        const SCEV *op = UD->getLHS();
+        writeBounds(op, isUpperBound, arg);
+        Out << " / ";
+        op = UD->getRHS();
+        writeBounds(op, isUpperBound, arg);
+        Out << ")";
+        break;
+      }
+    case scAddRecExpr: {
+        const SCEVAddRecExpr *AR = cast<SCEVAddRecExpr>(scev);
+        const SCEV *start = AR->getStart();
+        Out << "(";
+        writeBounds(start, isUpperBound, arg);
+        if (isUpperBound) {
+          Out << ") + ";
+          writeBounds(AR->getOperand(1), isUpperBound, arg);
+          Out << "* (";
+          writeBounds(SE->getBackedgeTakenCount(AR->getLoop()), isUpperBound, arg);
+        }
+        Out << ")";
+        break;
+      }
+    case scUMaxExpr: {
+        const SCEVUMaxExpr *M = cast<SCEVUMaxExpr>(scev);
+        Out << "mxpa_smax(";
+        assert(M->getNumOperands() == 2);
+        const SCEV *op = M->getOperand(0);
+        writeBounds(op, isUpperBound, arg);
+        Out << ", ";
+        op = M->getOperand(1);
+        writeBounds(op, isUpperBound, arg);
+        Out << ")";
+        break;
+      }
+    case scSMaxExpr: {
+        const SCEVSMaxExpr *M = cast<SCEVSMaxExpr>(scev);
+        Out << "mxpa_smax(";
+        assert(M->getNumOperands() == 2);
+        const SCEV *op = M->getOperand(0);
+        writeBounds(op, isUpperBound, arg);
+        Out << ", ";
+        op = M->getOperand(1);
+        writeBounds(op, isUpperBound, arg);
+        Out << ")";
+        break;
+      }
+    case scUnknown: {
+        const SCEVUnknown *U = cast<SCEVUnknown>(scev);
+        Value *v = U->getValue();
+        writeBoundsUnknown(v, isUpperBound, arg);
+        break;
+      }
+    case scCouldNotCompute:
+      Out << "***COULDNOTCOMPUTE***";
+      return;
+    default:
+      // This condition may happen because some SCEVType may be lost in the
+      // former switch cases.
+      assert(false && "A SCEVType is lost!!!");
+      break;
+  };
+#if 0
+  llvm::errs() << "Inner loop trip count: ";
+  SE->getBackedgeTakenCount(AR->getLoop())->dump();
+#endif
+}
+
+static bool checkValidFun(std::string funname) {
+  std::string funList[] = {
+    "get_global_id",
+    "get_local_id",
+    "get_global_size",
+    "get_local_size",
+    "get_global_offset",
+    "get_work_dim",
+    "get_group_id",
+    "get_num_groups",
+    "_Z5mad24iii"
+  };
+  unsigned i = 0;
+  for (; i < sizeof(funList) / sizeof(std::string); ++i) {
+    if (funname == funList[i]) {
+      break;
+    }
+  }
+  if (i == sizeof(funList) / sizeof(std::string)) {
+    return 1;
+  }
+  return 0;
+}
+
+void CWriter::CheckBounds(const SCEV *scev, bool isUpperBound, char &ret) {
+  switch (scev->getSCEVType()) {
+    case scTruncate: {
+        const SCEVTruncateExpr *Trunc = cast<SCEVTruncateExpr>(scev);
+        const SCEV *op = Trunc->getOperand();
+        CheckBounds(op, isUpperBound, ret);
+        break;
+      }
+    case scZeroExtend: {
+        const SCEVZeroExtendExpr *A = cast<SCEVZeroExtendExpr>(scev);
+        const SCEV *op = A->getOperand();
+        CheckBounds(op, isUpperBound, ret);
+        break;
+      }
+    case scSignExtend: {
+        const SCEVSignExtendExpr *SExt = cast<SCEVSignExtendExpr>(scev);
+        const SCEV *op = SExt->getOperand();
+        CheckBounds(op, isUpperBound, ret);
+        break;
+      }
+    case scAddExpr: {
+        const SCEVAddExpr *A = cast<SCEVAddExpr>(scev);
+        for (size_t i = 0; i < A->getNumOperands(); i++) {
+          CheckBounds(A->getOperand(i), isUpperBound, ret);
+        }
+        break;
+      }
+    case scMulExpr: {
+        const SCEVMulExpr *M = cast<SCEVMulExpr>(scev);
+        for (size_t i = 0; i < M->getNumOperands(); i++) {
+          CheckBounds(M->getOperand(i), isUpperBound, ret);
+        }
+        break;
+      }
+    case scUDivExpr: {
+        const SCEVUDivExpr *UD = cast<SCEVUDivExpr>(scev);
+        const SCEV *op = UD->getLHS();
+        CheckBounds(op, isUpperBound, ret);
+        op = UD->getRHS();
+        CheckBounds(op, isUpperBound, ret);
+        break;
+      }
+    case scAddRecExpr: {
+        const SCEVAddRecExpr *AR = cast<SCEVAddRecExpr>(scev);
+        const SCEV *start = AR->getStart();
+        CheckBounds(start, isUpperBound, ret);
+        if (isUpperBound) {
+          CheckBounds(AR->getOperand(1), isUpperBound, ret);
+          CheckBounds(SE->getBackedgeTakenCount(AR->getLoop()), isUpperBound,
+                      ret);
+        }
+        break;
+      }
+    case scSMaxExpr: {
+        const SCEVSMaxExpr *M = cast<SCEVSMaxExpr>(scev);
+        assert(M->getNumOperands() == 2);
+        CheckBounds(M->getOperand(0), isUpperBound, ret);
+        CheckBounds(M->getOperand(1), isUpperBound, ret);
+        break;
+      }
+    case scUnknown: {
+        const SCEVUnknown *U = cast<SCEVUnknown>(scev);
+        Value *v = U->getValue();
+        if (CallInst *CI = dyn_cast<CallInst>(v)) {
+          if (checkValidFun(CI->getCalledFunction()->getName())) {
+            ret = (ret & 0xFE) | 0x1;
+            break;
+          }
+          CallSite CS(CI);
+          CallSite::arg_iterator AI = CS.arg_begin(), AE = CS.arg_end();
+          unsigned ArgNo = 0;
+          for (; AI != AE; ++AI, ++ArgNo) {
+            CheckBounds(SE->getSCEV(*AI), isUpperBound, ret);
+          }
+        } else if (LoadInst *I = dyn_cast<LoadInst>(v)) {
+          CheckBounds(SE->getSCEV(I->getOperand(0)), isUpperBound, ret);
+          ret = (ret & 0xFD) | 0x2;
+          break;
+        } else if (SDivOperator *DI = dyn_cast<SDivOperator>(v)) {
+          CheckBounds(SE->getSCEV(DI->getOperand(0)), isUpperBound, ret);
+          CheckBounds(SE->getSCEV(DI->getOperand(1)), isUpperBound, ret);
+          break;
+        } else if (dyn_cast<PHINode>(v)) {
+          ret = (ret & 0xFE) | 0x1;
+          break;
+        } else if (!isa<Argument>(v)) {
+          ret = (ret & 0xFE) | 0x1;
+        }
+        break;
+      }
+    case scCouldNotCompute: {
+        ret = (ret & 0xFE) | 0x1;
+        break;
+      }
+  };
+}
+
+namespace {
+static Value *GetSCEVBase(ScalarEvolution *SE, const SCEV *scev) {
+  switch (scev->getSCEVType()) {
+    case scAddRecExpr: {
+        const SCEVAddRecExpr *AR = cast<SCEVAddRecExpr>(scev);
+        const SCEV *start = AR->getStart();
+        return GetSCEVBase(SE, start);
+        break;
+      }
+    case scAddExpr: {
+        const SCEVAddExpr *A = cast<SCEVAddExpr>(scev);
+        for (size_t i = 0; i < A->getNumOperands(); i++) {
+          const SCEV *op = A->getOperand(i);
+          Value *v = GetSCEVBase(SE, op);
+          if (v) {
+            return v;
+          }
+        }
+        break;
+      }
+    case scUnknown: {
+        const SCEVUnknown *U = cast<SCEVUnknown>(scev);
+        Value *v = U->getValue();
+        // pointer arguments are disregarded
+        if (v->getType()->isPointerTy()) {
+          return v;
+        }
+        break;
+      }
+  };
+  return NULL;
+}
+
+static bool isInnerArgument(Value *V) {
+  bool isInnerArg = false;
+  for (Value::user_iterator i = V->user_begin(), ie = V->user_end();
+       i != ie; ++i) {
+    if (isa<CallInst>(*i)) {
+      isInnerArg = isInnerArg || true;
+    }
+  }
+  return isInnerArg;
+}
+}
+#endif
 void CWriter::writeMemoryAccess(Value *Operand, Type *OperandType,
                                 bool IsVolatile, unsigned Alignment) {
+#if MXPA_CODEGEN
+  const SCEV *scev = SE->getSCEV(Operand);
+  Value *v = GetSCEVBase(SE, scev);
+  if (v) {
+    std::set<const SCEV *> &scevs = MemoryAccesses[v];
+    scevs.insert(scev);
+    for (Value::user_iterator ui = Operand->user_begin(), ue = Operand->user_end();
+         ui != ue; ui++) {
+      Value *uv = *ui;
+      if (Instruction *I = dyn_cast<Instruction>(uv)) {
+        if (I->mayWriteToMemory()) {
+          MemoryWrites.insert(scev);
+        }
+      }
+    }
+  } else {
+    errs() << "CWriter: Cannot locate the base of a memory access. Upper/lower "
+           "bound analysis may be inaccurate\n";
+  }
+#endif
+
 #if 0
   bool IsUnaligned = Alignment &&
                      Alignment < TD->getABITypeAlignment(OperandType);
@@ -3982,6 +5483,9 @@ void CWriter::writeMemoryAccess(Value *Operand, Type *OperandType,
 }
 
 void CWriter::visitLoadInst(LoadInst &I) {
+  const SCEV *scev = SE->getSCEV(I.getOperand(0));
+  Value *v = GetSCEVBase(SE, scev);
+  MemoryElementSize[v] = SE->getElementSize(&I);
   writeMemoryAccess(I.getOperand(0), I.getType(), I.isVolatile(),
                     I.getAlignment());
 
@@ -3998,6 +5502,9 @@ void CWriter::visitStoreInst(StoreInst &I) {
     printType(Out, I.getOperand(0)->getType());
     Out << "))";
   } else {
+    const SCEV *scev = SE->getSCEV(I.getPointerOperand());
+    Value *v = GetSCEVBase(SE, scev);
+    MemoryElementSize[v] = SE->getElementSize(&I);
     writeMemoryAccess(I.getPointerOperand(), I.getOperand(0)->getType(),
                       I.isVolatile(), I.getAlignment());
     Out << " = ";
@@ -4059,6 +5566,8 @@ void CWriter::visitExtractElementInst(ExtractElementInst &I) {
   Out << "]";
 }
 
+// <result> = shufflevector <n x <ty>> <v1>, <n x <ty>> <v2>, <m x i32> <mask>
+// ; yields <m x <ty>>
 void CWriter::visitShuffleVectorInst(ShuffleVectorInst &SVI) {
   Out << "(";
   printType(Out, SVI.getType());
@@ -4139,8 +5648,97 @@ void CWriter::visitExtractValueInst(ExtractValueInst &EVI) {
   Out << ")";
 }
 
+/// getKernelFnCallees - Get the callees of a kernel functions if the
+/// function attributes of the callees are the same as the kernel function's.
+void CWriter::getKernelFnCallees(const Module &M) {
+  for (Module::const_iterator I = M.begin(), E = M.end(); I != E; ++I) {
+    if (!isKernelFunction(I)) {
+      continue;
+    }
+
+    KernelFunctionAS = I->getAttributes().getFnAttributes();
+
+    for (Function::const_iterator b = I->begin(), be = I->end();
+         b != be; ++b) {
+      for (BasicBlock::const_iterator i = b->begin(), ie = b->end();
+           i != ie; ++i) {
+        const CallInst *callInst = dyn_cast<CallInst>(&*i);
+        if (!callInst) {
+          continue;
+        }
+        const Function *kcallee = callInst->getCalledFunction();
+        if (!kcallee) {
+          continue;
+        }
+
+        const AttributeSet &kcalleeAS =
+          kcallee->getAttributes().getFnAttributes();
+        if (kcalleeAS != KernelFunctionAS) {
+          continue;
+        }
+
+        std::set<const Function *>::iterator IC = KernelFnCallees.find(kcallee);
+        if (IC != KernelFnCallees.end()) {
+          continue;
+        }
+        KernelFnCallees.insert(kcallee);
+      }
+    }
+  }
+}
+
+/// getInlinedCallees - Get the inlineable non-kernel functions on conditions
+/// that (1) Their function attributes are the same as the kernel's, and
+//  (2) They are not in the set KernelFnCallees.
+void CWriter::getInlinedCallees(const Module &M) {
+  for (Module::const_iterator I = M.begin(), E = M.end(); I != E; ++I) {
+    const AttributeSet &AS = I->getAttributes().getFnAttributes();
+    if (AS != KernelFunctionAS) {
+      continue;
+    }
+
+    if (isKernelFunction(I)) {
+      continue;
+    }
+
+    std::set<const Function *>::iterator it = KernelFnCallees.find(I);
+    if (it != KernelFnCallees.end()) {
+      if (NonInlinedCallees.find(I) != NonInlinedCallees.end()) {
+        continue;
+      }
+      NonInlinedCallees.insert(I);
+    }
+    InlinedCallees.insert(I);
+  }
+}
+
+/// getLaunchKernels - Get the list of launch kernes annotated by metadata
+/// launch.kernels
+void CWriter::getLaunchKernels(const Module &M) {
+  NamedMDNode *launchKernelMetadata =
+    TheModule->getNamedMetadata("launch.kernels");
+
+  if (!launchKernelMetadata) {
+    return;
+  }
+
+  unsigned launchKernelNum = launchKernelMetadata->getNumOperands();
+  for (unsigned K = 0, E = launchKernelNum; K != E; ++K) {
+    MDNode *kernelMD =  dyn_cast<MDNode>(launchKernelMetadata->getOperand(K));
+    if (!kernelMD->getOperand(0)) {
+      continue;
+    }
+    Function *fun = dyn_cast<Function>(kernelMD->getOperand(0));
+    LaunchKernels.insert(fun);
+  }
+}
+
 void CWriter::run(const Module &M, bool onlyNamed) {
   OnlyNamed = onlyNamed;
+
+  getKernelFnCallees(M);
+  getInlinedCallees(M);
+  getLaunchKernels(M);
 
   // Get types from global variables.
   for (Module::const_global_iterator I = M.global_begin(),
