@@ -62,293 +62,306 @@ extern "C" void LLVMInitializeCBackendTarget() {
 }
 
 namespace {
-  class CBEMCAsmInfo : public MCAsmInfo {
-  public:
-    CBEMCAsmInfo() {
-      //GlobalPrefix = "";
-      PrivateGlobalPrefix = "";
-    }
-  };
+class CBEMCAsmInfo : public MCAsmInfo {
+public:
+  CBEMCAsmInfo() {
+    //GlobalPrefix = "";
+    PrivateGlobalPrefix = "";
+  }
+};
 
-  /// CWriter - This class is the main chunk of code that converts an LLVM
-  /// module to a C translation unit.
-  class CWriter : public FunctionPass, public InstVisitor<CWriter> {
-    formatted_raw_ostream &Out;
-    IntrinsicLowering *IL;
-    Mangler *Mang;
-    LoopInfo *LI;
-    const Module *TheModule;
-    const MCAsmInfo* TAsm;
-    const MCRegisterInfo *MRI;
-    const MCObjectFileInfo *MOFI;
-    MCContext *TCtx;
-    const DataLayout* TD;
-    
-    std::map<const ConstantFP *, unsigned> FPConstantMap;
-    std::set<Function*> intrinsicPrototypesAlreadyGenerated;
-    std::set<const Argument*> ByValParams;
-    unsigned FPCounter;
-    unsigned OpaqueCounter;
-    DenseMap<const Value*, unsigned> AnonValueNumbers;
-    unsigned NextAnonValueNumber;
+/// CWriter - This class is the main chunk of code that converts an LLVM
+/// module to a C translation unit.
+class CWriter : public FunctionPass, public InstVisitor<CWriter> {
+  formatted_raw_ostream &Out;
+  IntrinsicLowering *IL;
+  Mangler *Mang;
+  LoopInfo *LI;
+  const Module *TheModule;
+  const MCAsmInfo *TAsm;
+  const MCRegisterInfo *MRI;
+  const MCObjectFileInfo *MOFI;
+  MCContext *TCtx;
+  const DataLayout *TD;
 
-    bool OnlyNamed;
-    std::vector<StructType*> StructTypes;
-    DenseSet<const Value*> VisitedConstants;
-    DenseSet<Type*> VisitedTypes;
+  std::map<const ConstantFP *, unsigned> FPConstantMap;
+  std::set<Function *> intrinsicPrototypesAlreadyGenerated;
+  std::set<const Argument *> ByValParams;
+  unsigned FPCounter;
+  unsigned OpaqueCounter;
+  DenseMap<const Value *, unsigned> AnonValueNumbers;
+  unsigned NextAnonValueNumber;
 
-    /// UnnamedStructIDs - This contains a unique ID for each struct that is
-    /// either anonymous or has no name.
-    DenseMap<StructType*, unsigned> UnnamedStructIDs;
-    
-  public:
-    static char ID;
-    explicit CWriter(formatted_raw_ostream &o)
-      : FunctionPass(ID), Out(o), IL(0), Mang(0), LI(0),
-        TheModule(0), TAsm(0), MRI(0), MOFI(0), TCtx(0), TD(0),
-        OpaqueCounter(0), NextAnonValueNumber(0) {
-      initializeLoopInfoPass(*PassRegistry::getPassRegistry());
-      FPCounter = 0;
-    }
+  bool OnlyNamed;
+  std::vector<StructType *> StructTypes;
+  DenseSet<const Value *> VisitedConstants;
+  DenseSet<Type *> VisitedTypes;
 
-    virtual const char *getPassName() const { return "C backend"; }
+  /// UnnamedStructIDs - This contains a unique ID for each struct that is
+  /// either anonymous or has no name.
+  DenseMap<StructType *, unsigned> UnnamedStructIDs;
 
-    void getAnalysisUsage(AnalysisUsage &AU) const {
-      AU.addRequired<LoopInfo>();
-      AU.setPreservesAll();
-    }
+public:
+  static char ID;
+  explicit CWriter(formatted_raw_ostream &o)
+    : FunctionPass(ID), Out(o), IL(0), Mang(0), LI(0),
+      TheModule(0), TAsm(0), MRI(0), MOFI(0), TCtx(0), TD(0),
+      OpaqueCounter(0), NextAnonValueNumber(0) {
+    initializeLoopInfoPass(*PassRegistry::getPassRegistry());
+    FPCounter = 0;
+  }
 
-    virtual bool doInitialization(Module &M);
+  virtual const char *getPassName() const {
+    return "C backend";
+  }
 
-    bool runOnFunction(Function &F) {
-     // Do not codegen any 'available_externally' functions at all, they have
-     // definitions outside the translation unit.
-     if (F.hasAvailableExternallyLinkage())
-       return false;
+  void getAnalysisUsage(AnalysisUsage &AU) const {
+    AU.addRequired<LoopInfo>();
+    AU.setPreservesAll();
+  }
 
-      LI = &getAnalysis<LoopInfo>();
+  virtual bool doInitialization(Module &M);
 
-      // Get rid of intrinsics we can't handle.
-      lowerIntrinsics(F);
-
-      // Output all floating point constants that cannot be printed accurately.
-      printFloatingPointConstants(F);
-
-      printFunction(F);
+  bool runOnFunction(Function &F) {
+    // Do not codegen any 'available_externally' functions at all, they have
+    // definitions outside the translation unit.
+    if (F.hasAvailableExternallyLinkage()) {
       return false;
     }
 
-    virtual bool doFinalization(Module &M) {
-      // Free memory...
-      delete IL;
-      delete TD;
-      delete Mang;
-      delete TCtx;
-      delete TAsm;
-      delete MRI;
-      delete MOFI;
-      FPConstantMap.clear();
-      ByValParams.clear();
-      intrinsicPrototypesAlreadyGenerated.clear();
-      UnnamedStructIDs.clear();
+    LI = &getAnalysis<LoopInfo>();
+
+    // Get rid of intrinsics we can't handle.
+    lowerIntrinsics(F);
+
+    // Output all floating point constants that cannot be printed accurately.
+    printFloatingPointConstants(F);
+
+    printFunction(F);
+    return false;
+  }
+
+  virtual bool doFinalization(Module &M) {
+    // Free memory...
+    delete IL;
+    delete TD;
+    delete Mang;
+    delete TCtx;
+    delete TAsm;
+    delete MRI;
+    delete MOFI;
+    FPConstantMap.clear();
+    ByValParams.clear();
+    intrinsicPrototypesAlreadyGenerated.clear();
+    UnnamedStructIDs.clear();
+    return false;
+  }
+
+  raw_ostream &printType(raw_ostream &Out, Type *Ty,
+                         bool isSigned = false,
+                         const std::string &VariableName = "",
+                         bool IgnoreName = false,
+                         const AttributeSet &PAL = AttributeSet());
+  raw_ostream &printSimpleType(raw_ostream &Out, Type *Ty,
+                               bool isSigned,
+                               const std::string &NameSoFar = "");
+
+  void printStructReturnPointerFunctionType(raw_ostream &Out,
+      const AttributeSet &PAL,
+      PointerType *Ty);
+
+  std::string getStructName(StructType *ST);
+
+  /// writeOperandDeref - Print the result of dereferencing the specified
+  /// operand with '*'.  This is equivalent to printing '*' then using
+  /// writeOperand, but avoids excess syntax in some cases.
+  void writeOperandDeref(Value *Operand) {
+    if (isAddressExposed(Operand)) {
+      // Already something with an address exposed.
+      writeOperandInternal(Operand);
+    } else {
+      Out << "*(";
+      writeOperand(Operand);
+      Out << ")";
+    }
+  }
+
+  bool isKernelFunction(const Function *F);
+  void writeOperand(Value *Operand, bool Static = false);
+  void writeInstComputationInline(Instruction &I);
+  void writeOperandInternal(Value *Operand, bool Static = false);
+  void writeOperandWithCast(Value *Operand, unsigned Opcode);
+  void writeOperandWithCast(Value *Operand, const ICmpInst &I);
+  bool writeInstructionCast(const Instruction &I);
+
+  void writeMemoryAccess(Value *Operand, Type *OperandType,
+                         bool IsVolatile, unsigned Alignment);
+
+private :
+  std::string InterpretASMConstraint(InlineAsm::ConstraintInfo &c);
+
+  void lowerIntrinsics(Function &F);
+  /// Prints the definition of the intrinsic function F. Supports the
+  /// intrinsics which need to be explicitly defined in the CBackend.
+  void printIntrinsicDefinition(const Function &F, raw_ostream &Out);
+
+  void printModuleTypes();
+  void printContainedStructs(Type *Ty, SmallPtrSet<Type *, 16> &);
+  void printFloatingPointConstants(Function &F);
+  void printFloatingPointConstants(const Constant *C);
+  void printFunctionSignature(const Function *F, bool Prototype);
+
+  void printFunction(Function &);
+  void printBasicBlock(BasicBlock *BB);
+  void printLoop(Loop *L);
+
+  void printCast(unsigned opcode, Type *SrcTy, Type *DstTy);
+  void printConstant(Constant *CPV, bool Static);
+  void printConstantWithCast(Constant *CPV, unsigned Opcode);
+  bool printConstExprCast(const ConstantExpr *CE, bool Static);
+  void printConstantArray(ConstantArray *CPA, bool Static);
+  void printConstantVector(ConstantVector *CV, bool Static);
+  void printConstantDataSequential(ConstantDataSequential *CDS, bool Static);
+  void printFunctionPrivateVaraibles(Function &F);
+  void printInitializer(GlobalVariable *I);
+
+  /// isAddressExposed - Return true if the specified value's name needs to
+  /// have its address taken in order to get a C value of the correct type.
+  /// This happens for global variables, byval parameters, and direct allocas.
+  bool isAddressExposed(const Value *V) const {
+    if (const Argument *A = dyn_cast<Argument>(V)) {
+      return ByValParams.count(A);
+    }
+    return isa<GlobalVariable>(V) || isDirectAlloca(V);
+  }
+
+  // isInlinableInst - Attempt to inline instructions into their uses to build
+  // trees as much as possible.  To do this, we have to consistently decide
+  // what is acceptable to inline, so that variable declarations don't get
+  // printed and an extra copy of the expr is not emitted.
+  //
+  static bool isInlinableInst(const Instruction &I) {
+    // Always inline cmp instructions, even if they are shared by multiple
+    // expressions.  GCC generates horrible code if we don't.
+    if (isa<CmpInst>(I)) {
+      return true;
+    }
+
+    // Must be an expression, must be used exactly once.  If it is dead, we
+    // emit it inline where it would go.
+    if (I.getType() == Type::getVoidTy(I.getContext()) || !I.hasOneUse() ||
+        isa<TerminatorInst>(I) || isa<CallInst>(I) || isa<PHINode>(I) ||
+        isa<LoadInst>(I) || isa<VAArgInst>(I) || isa<InsertElementInst>(I) ||
+        isa<InsertValueInst>(I))
+      // Don't inline a load across a store or other bad things!
+    {
       return false;
     }
 
-    raw_ostream &printType(raw_ostream &Out, Type *Ty,
-                           bool isSigned = false,
-                           const std::string &VariableName = "",
-                           bool IgnoreName = false,
-                           const AttributeSet &PAL = AttributeSet());
-    raw_ostream &printSimpleType(raw_ostream &Out, Type *Ty,
-                                 bool isSigned,
-                                 const std::string &NameSoFar = "");
-
-    void printStructReturnPointerFunctionType(raw_ostream &Out,
-                                              const AttributeSet &PAL,
-                                              PointerType *Ty);
-
-    std::string getStructName(StructType *ST);
-    
-    /// writeOperandDeref - Print the result of dereferencing the specified
-    /// operand with '*'.  This is equivalent to printing '*' then using
-    /// writeOperand, but avoids excess syntax in some cases.
-    void writeOperandDeref(Value *Operand) {
-      if (isAddressExposed(Operand)) {
-        // Already something with an address exposed.
-        writeOperandInternal(Operand);
-      } else {
-        Out << "*(";
-        writeOperand(Operand);
-        Out << ")";
-      }
-    }
-
-    bool isKernelFunction(const Function *F);
-    void writeOperand(Value *Operand, bool Static = false);
-    void writeInstComputationInline(Instruction &I);
-    void writeOperandInternal(Value *Operand, bool Static = false);
-    void writeOperandWithCast(Value* Operand, unsigned Opcode);
-    void writeOperandWithCast(Value* Operand, const ICmpInst &I);
-    bool writeInstructionCast(const Instruction &I);
-
-    void writeMemoryAccess(Value *Operand, Type *OperandType,
-                           bool IsVolatile, unsigned Alignment);
-
-  private :
-    std::string InterpretASMConstraint(InlineAsm::ConstraintInfo& c);
-
-    void lowerIntrinsics(Function &F);
-    /// Prints the definition of the intrinsic function F. Supports the 
-    /// intrinsics which need to be explicitly defined in the CBackend.
-    void printIntrinsicDefinition(const Function &F, raw_ostream &Out);
-
-    void printModuleTypes();
-    void printContainedStructs(Type *Ty, SmallPtrSet<Type *, 16> &);
-    void printFloatingPointConstants(Function &F);
-    void printFloatingPointConstants(const Constant *C);
-    void printFunctionSignature(const Function *F, bool Prototype);
-
-    void printFunction(Function &);
-    void printBasicBlock(BasicBlock *BB);
-    void printLoop(Loop *L);
-
-    void printCast(unsigned opcode, Type *SrcTy, Type *DstTy);
-    void printConstant(Constant *CPV, bool Static);
-    void printConstantWithCast(Constant *CPV, unsigned Opcode);
-    bool printConstExprCast(const ConstantExpr *CE, bool Static);
-    void printConstantArray(ConstantArray *CPA, bool Static);
-    void printConstantVector(ConstantVector *CV, bool Static);
-    void printConstantDataSequential(ConstantDataSequential *CDS, bool Static);
-    void printFunctionPrivateVaraibles(Function&F);
-    void printInitializer(GlobalVariable *I);
-
-    /// isAddressExposed - Return true if the specified value's name needs to
-    /// have its address taken in order to get a C value of the correct type.
-    /// This happens for global variables, byval parameters, and direct allocas.
-    bool isAddressExposed(const Value *V) const {
-      if (const Argument *A = dyn_cast<Argument>(V))
-        return ByValParams.count(A);
-      return isa<GlobalVariable>(V) || isDirectAlloca(V);
-    }
-
-    // isInlinableInst - Attempt to inline instructions into their uses to build
-    // trees as much as possible.  To do this, we have to consistently decide
-    // what is acceptable to inline, so that variable declarations don't get
-    // printed and an extra copy of the expr is not emitted.
-    //
-    static bool isInlinableInst(const Instruction &I) {
-      // Always inline cmp instructions, even if they are shared by multiple
-      // expressions.  GCC generates horrible code if we don't.
-      if (isa<CmpInst>(I))
-        return true;
-
-      // Must be an expression, must be used exactly once.  If it is dead, we
-      // emit it inline where it would go.
-      if (I.getType() == Type::getVoidTy(I.getContext()) || !I.hasOneUse() ||
-          isa<TerminatorInst>(I) || isa<CallInst>(I) || isa<PHINode>(I) ||
-          isa<LoadInst>(I) || isa<VAArgInst>(I) || isa<InsertElementInst>(I) ||
-          isa<InsertValueInst>(I))
-        // Don't inline a load across a store or other bad things!
+    // Must not be used in inline asm, extractelement, or shufflevector.
+    if (I.hasOneUse()) {
+      const Instruction &User = cast<Instruction>(*I.user_back());
+      if (isInlineAsm(User) || isa<ExtractElementInst>(User) ||
+          isa<ShuffleVectorInst>(User)) {
         return false;
-
-      // Must not be used in inline asm, extractelement, or shufflevector.
-      if (I.hasOneUse()) {
-        const Instruction &User = cast<Instruction>(*I.user_back());
-        if (isInlineAsm(User) || isa<ExtractElementInst>(User) ||
-            isa<ShuffleVectorInst>(User))
-          return false;
       }
-
-      // Only inline instruction it if it's use is in the same BB as the inst.
-      return I.getParent() == cast<Instruction>(I.user_back())->getParent();
     }
 
-    // isDirectAlloca - Define fixed sized allocas in the entry block as direct
-    // variables which are accessed with the & operator.  This causes GCC to
-    // generate significantly better code than to emit alloca calls directly.
-    //
-    static const AllocaInst *isDirectAlloca(const Value *V) {
-      const AllocaInst *AI = dyn_cast<AllocaInst>(V);
-      if (!AI) return 0;
-      if (AI->isArrayAllocation())
-        return 0;   // FIXME: we can also inline fixed size array allocas!
-      if (AI->getParent() != &AI->getParent()->getParent()->getEntryBlock())
-        return 0;
-      return AI;
+    // Only inline instruction it if it's use is in the same BB as the inst.
+    return I.getParent() == cast<Instruction>(I.user_back())->getParent();
+  }
+
+  // isDirectAlloca - Define fixed sized allocas in the entry block as direct
+  // variables which are accessed with the & operator.  This causes GCC to
+  // generate significantly better code than to emit alloca calls directly.
+  //
+  static const AllocaInst *isDirectAlloca(const Value *V) {
+    const AllocaInst *AI = dyn_cast<AllocaInst>(V);
+    if (!AI) {
+      return 0;
     }
-
-    // isInlineAsm - Check if the instruction is a call to an inline asm chunk.
-    static bool isInlineAsm(const Instruction& I) {
-      if (const CallInst *CI = dyn_cast<CallInst>(&I))
-        return isa<InlineAsm>(CI->getCalledValue());
-      return false;
+    if (AI->isArrayAllocation()) {
+      return 0;  // FIXME: we can also inline fixed size array allocas!
     }
-
-    // Instruction visitation functions
-    friend class InstVisitor<CWriter>;
-
-    void visitReturnInst(ReturnInst &I);
-    void visitBranchInst(BranchInst &I);
-    void visitSwitchInst(SwitchInst &I);
-    void visitIndirectBrInst(IndirectBrInst &I);
-    void visitInvokeInst(InvokeInst &I) {
-      llvm_unreachable("Lowerinvoke pass didn't work!");
+    if (AI->getParent() != &AI->getParent()->getParent()->getEntryBlock()) {
+      return 0;
     }
-    void visitResumeInst(ResumeInst &I) {
-      llvm_unreachable("DwarfEHPrepare pass didn't work!");
+    return AI;
+  }
+
+  // isInlineAsm - Check if the instruction is a call to an inline asm chunk.
+  static bool isInlineAsm(const Instruction &I) {
+    if (const CallInst *CI = dyn_cast<CallInst>(&I)) {
+      return isa<InlineAsm>(CI->getCalledValue());
     }
-    void visitUnreachableInst(UnreachableInst &I);
+    return false;
+  }
 
-    void visitPHINode(PHINode &I);
-    void visitBinaryOperator(Instruction &I);
-    void visitICmpInst(ICmpInst &I);
-    void visitFCmpInst(FCmpInst &I);
+  // Instruction visitation functions
+  friend class InstVisitor<CWriter>;
 
-    void visitCastInst (CastInst &I);
-    void visitSelectInst(SelectInst &I);
-    void visitCallInst (CallInst &I);
-    void visitInlineAsm(CallInst &I);
-    bool visitBuiltinCall(CallInst &I, Intrinsic::ID ID, bool &WroteCallee);
+  void visitReturnInst(ReturnInst &I);
+  void visitBranchInst(BranchInst &I);
+  void visitSwitchInst(SwitchInst &I);
+  void visitIndirectBrInst(IndirectBrInst &I);
+  void visitInvokeInst(InvokeInst &I) {
+    llvm_unreachable("Lowerinvoke pass didn't work!");
+  }
+  void visitResumeInst(ResumeInst &I) {
+    llvm_unreachable("DwarfEHPrepare pass didn't work!");
+  }
+  void visitUnreachableInst(UnreachableInst &I);
 
-    void visitAllocaInst(AllocaInst &I);
-    void visitLoadInst  (LoadInst   &I);
-    void visitStoreInst (StoreInst  &I);
-    void visitGetElementPtrInst(GetElementPtrInst &I);
-    void visitVAArgInst (VAArgInst &I);
+  void visitPHINode(PHINode &I);
+  void visitBinaryOperator(Instruction &I);
+  void visitICmpInst(ICmpInst &I);
+  void visitFCmpInst(FCmpInst &I);
 
-    void visitInsertElementInst(InsertElementInst &I);
-    void visitExtractElementInst(ExtractElementInst &I);
-    void visitShuffleVectorInst(ShuffleVectorInst &SVI);
+  void visitCastInst(CastInst &I);
+  void visitSelectInst(SelectInst &I);
+  void visitCallInst(CallInst &I);
+  void visitInlineAsm(CallInst &I);
+  bool visitBuiltinCall(CallInst &I, Intrinsic::ID ID, bool &WroteCallee);
 
-    void visitInsertValueInst(InsertValueInst &I);
-    void visitExtractValueInst(ExtractValueInst &I);
+  void visitAllocaInst(AllocaInst &I);
+  void visitLoadInst(LoadInst   &I);
+  void visitStoreInst(StoreInst  &I);
+  void visitGetElementPtrInst(GetElementPtrInst &I);
+  void visitVAArgInst(VAArgInst &I);
 
-    void visitInstruction(Instruction &I) {
+  void visitInsertElementInst(InsertElementInst &I);
+  void visitExtractElementInst(ExtractElementInst &I);
+  void visitShuffleVectorInst(ShuffleVectorInst &SVI);
+
+  void visitInsertValueInst(InsertValueInst &I);
+  void visitExtractValueInst(ExtractValueInst &I);
+
+  void visitInstruction(Instruction &I) {
 #ifndef NDEBUG
-      errs() << "C Writer does not know about " << I;
+    errs() << "C Writer does not know about " << I;
 #endif
-      llvm_unreachable(0);
-    }
+    llvm_unreachable(0);
+  }
 
-    void outputLValue(Instruction *I) {
-      Out << "  " << GetValueName(I) << " = ";
-    }
+  void outputLValue(Instruction *I) {
+    Out << "  " << GetValueName(I) << " = ";
+  }
 
-    bool isGotoCodeNecessary(BasicBlock *From, BasicBlock *To);
-    void printPHICopiesForSuccessor(BasicBlock *CurBlock,
-                                    BasicBlock *Successor, unsigned Indent);
-    void printBranchToBlock(BasicBlock *CurBlock, BasicBlock *SuccBlock,
-                            unsigned Indent);
-    void printGEPExpression(Value *Ptr, gep_type_iterator I,
-                            gep_type_iterator E, bool Static);
+  bool isGotoCodeNecessary(BasicBlock *From, BasicBlock *To);
+  void printPHICopiesForSuccessor(BasicBlock *CurBlock,
+                                  BasicBlock *Successor, unsigned Indent);
+  void printBranchToBlock(BasicBlock *CurBlock, BasicBlock *SuccBlock,
+                          unsigned Indent);
+  void printGEPExpression(Value *Ptr, gep_type_iterator I,
+                          gep_type_iterator E, bool Static);
 
-    std::string GetValueName(const Value *Operand);
+  std::string GetValueName(const Value *Operand);
 
-    void run(const Module &M, bool onlyNamed);
-    void incorporateType(const Module &M,Type *Ty);
-    void incorporateValue(const Module &M, const Value *V);
-    void incorporateMDNode(const Module &M, const MDNode *V);
-  };
+  void run(const Module &M, bool onlyNamed);
+  void incorporateType(const Module &M, Type *Ty);
+  void incorporateValue(const Module &M, const Value *V);
+  void incorporateMDNode(const Module &M, const MDNode *V);
+};
 }
 
 char CWriter::ID = 0;
@@ -363,17 +376,18 @@ static std::string CBEMangle(const std::string &S) {
       Result += S[i];
     } else {
       Result += '_';
-      Result += 'A'+(S[i]&15);
-      Result += 'A'+((S[i]>>4)&15);
+      Result += 'A' + (S[i] & 15);
+      Result += 'A' + ((S[i] >> 4) & 15);
       Result += '_';
     }
   return Result;
 }
 
 std::string CWriter::getStructName(StructType *ST) {
-  if (!ST->isLiteral() && !ST->getName().empty())
-    return CBEMangle("l_"+ST->getName().str());
-  
+  if (!ST->isLiteral() && !ST->getName().empty()) {
+    return CBEMangle("l_" + ST->getName().str());
+  }
+
   return "l_unnamed_" + utostr(UnnamedStructIDs[ST]);
 }
 
@@ -382,8 +396,8 @@ std::string CWriter::getStructName(StructType *ST) {
 /// return type, except, instead of printing the type as void (*)(Struct*, ...)
 /// print it as "Struct (*)(...)", for struct return functions.
 void CWriter::printStructReturnPointerFunctionType(raw_ostream &Out,
-                                                   const AttributeSet &PAL,
-                                                   PointerType *TheTy) {
+    const AttributeSet &PAL,
+    PointerType *TheTy) {
   FunctionType *FTy = cast<FunctionType>(TheTy->getElementType());
   std::string tstr;
   raw_string_ostream FunctionInnards(tstr);
@@ -394,27 +408,29 @@ void CWriter::printStructReturnPointerFunctionType(raw_ostream &Out,
   Type *RetTy = cast<PointerType>(*I)->getElementType();
   unsigned Idx = 1;
   for (++I, ++Idx; I != E; ++I, ++Idx) {
-    if (PrintedType)
+    if (PrintedType) {
       FunctionInnards << ", ";
+    }
     Type *ArgTy = *I;
     if (PAL.hasAttribute(Idx, Attribute::ByVal)) {
       assert(ArgTy->isPointerTy());
       ArgTy = cast<PointerType>(ArgTy)->getElementType();
     }
     printType(FunctionInnards, ArgTy,
-        /*isSigned=*/PAL.hasAttribute(Idx, Attribute::SExt), "");
+              /*isSigned=*/PAL.hasAttribute(Idx, Attribute::SExt), "");
     PrintedType = true;
   }
   if (FTy->isVarArg()) {
-    if (!PrintedType)
-      FunctionInnards << " int"; //dummy argument for empty vararg functs
+    if (!PrintedType) {
+      FunctionInnards << " int";  //dummy argument for empty vararg functs
+    }
     FunctionInnards << ", ...";
   } else if (!PrintedType) {
     FunctionInnards << "void";
   }
   FunctionInnards << ')';
   printType(Out, RetTy,
-      /*isSigned=*/PAL.hasAttribute(0, Attribute::SExt), FunctionInnards.str());
+            /*isSigned=*/PAL.hasAttribute(0, Attribute::SExt), FunctionInnards.str());
 }
 
 raw_ostream &
@@ -423,48 +439,48 @@ CWriter::printSimpleType(raw_ostream &Out, Type *Ty, bool isSigned,
   assert(((Ty->getTypeID() >= 0 && Ty->getTypeID() <= 9) || Ty->isIntegerTy() || Ty->isVectorTy()) &&
          "Invalid type for printSimpleType");
   switch (Ty->getTypeID()) {
-  case Type::VoidTyID:   return Out << "void " << NameSoFar;
-  case Type::IntegerTyID: {
-    unsigned NumBits = cast<IntegerType>(Ty)->getBitWidth();
-    if (NumBits == 1)
-      return Out << "bool " << NameSoFar;
-    else if (NumBits <= 8)
-      return Out << (isSigned?"signed":"unsigned") << " char " << NameSoFar;
-    else if (NumBits <= 16)
-      return Out << (isSigned?"signed":"unsigned") << " short " << NameSoFar;
-    else if (NumBits <= 32)
-      return Out << (isSigned?"signed":"unsigned") << " int " << NameSoFar;
-    else if (NumBits <= 64)
-      return Out << (isSigned?"signed":"unsigned") << " long "<< NameSoFar;
-    else {
-      assert(NumBits <= 128 && "Bit widths > 128 not implemented yet");
-      return Out << (isSigned?"llvmInt128":"llvmUInt128") << " " << NameSoFar;
-    }
-  }
-  case Type::FloatTyID:  return Out << "float "   << NameSoFar;
-  case Type::DoubleTyID: return Out << "double "  << NameSoFar;
-  // Lacking emulation of FP80 on PPC, etc., we assume whichever of these is
-  // present matches host 'long double'.
-  case Type::X86_FP80TyID:
-  case Type::PPC_FP128TyID:
-  case Type::FP128TyID:  return Out << "long double " << NameSoFar;
+    case Type::VoidTyID:   return Out << "void " << NameSoFar;
+    case Type::IntegerTyID: {
+        unsigned NumBits = cast<IntegerType>(Ty)->getBitWidth();
+        if (NumBits == 1) {
+          return Out << "bool " << NameSoFar;
+        } else if (NumBits <= 8) {
+          return Out << (isSigned ? "signed" : "unsigned") << " char " << NameSoFar;
+        } else if (NumBits <= 16) {
+          return Out << (isSigned ? "signed" : "unsigned") << " short " << NameSoFar;
+        } else if (NumBits <= 32) {
+          return Out << (isSigned ? "signed" : "unsigned") << " int " << NameSoFar;
+        } else if (NumBits <= 64) {
+          return Out << (isSigned ? "signed" : "unsigned") << " long " << NameSoFar;
+        } else {
+          assert(NumBits <= 128 && "Bit widths > 128 not implemented yet");
+          return Out << (isSigned ? "llvmInt128" : "llvmUInt128") << " " << NameSoFar;
+        }
+      }
+    case Type::FloatTyID:  return Out << "float "   << NameSoFar;
+    case Type::DoubleTyID: return Out << "double "  << NameSoFar;
+      // Lacking emulation of FP80 on PPC, etc., we assume whichever of these is
+      // present matches host 'long double'.
+    case Type::X86_FP80TyID:
+    case Type::PPC_FP128TyID:
+    case Type::FP128TyID:  return Out << "long double " << NameSoFar;
 
-  case Type::X86_MMXTyID:
-    return printSimpleType(Out, Type::getInt32Ty(Ty->getContext()), isSigned,
-                     " __attribute__((vector_size(64))) " + NameSoFar);
+    case Type::X86_MMXTyID:
+      return printSimpleType(Out, Type::getInt32Ty(Ty->getContext()), isSigned,
+                             " __attribute__((vector_size(64))) " + NameSoFar);
 
-  case Type::VectorTyID: {
-    VectorType *VTy = cast<VectorType>(Ty);
-    return printSimpleType(Out, VTy->getElementType(), isSigned,
-                     " __attribute__((vector_size(" +
-                     utostr(TD->getTypeAllocSize(VTy)) + " ))) " + NameSoFar);
-  }
+    case Type::VectorTyID: {
+        VectorType *VTy = cast<VectorType>(Ty);
+        return printSimpleType(Out, VTy->getElementType(), isSigned,
+                               " __attribute__((vector_size(" +
+                               utostr(TD->getTypeAllocSize(VTy)) + " ))) " + NameSoFar);
+      }
 
-  default:
+    default:
 #ifndef NDEBUG
-    errs() << "Unknown primitive type: " << *Ty << "\n";
+      errs() << "Unknown primitive type: " << *Ty << "\n";
 #endif
-    llvm_unreachable(0);
+      llvm_unreachable(0);
   }
 }
 
@@ -480,113 +496,122 @@ raw_ostream &CWriter::printType(raw_ostream &Out, Type *Ty,
   }
 
   switch (Ty->getTypeID()) {
-  case Type::FunctionTyID: {
-    FunctionType *FTy = cast<FunctionType>(Ty);
-    std::string tstr;
-    raw_string_ostream FunctionInnards(tstr);
-    FunctionInnards << " (" << NameSoFar << ") (";
-    unsigned Idx = 1;
-    for (FunctionType::param_iterator I = FTy->param_begin(),
-           E = FTy->param_end(); I != E; ++I) {
-      Type *ArgTy = *I;
-      if (PAL.hasAttribute(Idx, Attribute::ByVal)) {
-        assert(ArgTy->isPointerTy());
-        ArgTy = cast<PointerType>(ArgTy)->getElementType();
+    case Type::FunctionTyID: {
+        FunctionType *FTy = cast<FunctionType>(Ty);
+        std::string tstr;
+        raw_string_ostream FunctionInnards(tstr);
+        FunctionInnards << " (" << NameSoFar << ") (";
+        unsigned Idx = 1;
+        for (FunctionType::param_iterator I = FTy->param_begin(),
+             E = FTy->param_end(); I != E; ++I) {
+          Type *ArgTy = *I;
+          if (PAL.hasAttribute(Idx, Attribute::ByVal)) {
+            assert(ArgTy->isPointerTy());
+            ArgTy = cast<PointerType>(ArgTy)->getElementType();
+          }
+          if (I != FTy->param_begin()) {
+            FunctionInnards << ", ";
+          }
+          printType(FunctionInnards, ArgTy,
+                    /*isSigned=*/PAL.hasAttribute(Idx, Attribute::SExt), "");
+          ++Idx;
+        }
+        if (FTy->isVarArg()) {
+          if (!FTy->getNumParams()) {
+            FunctionInnards << " int";  //dummy argument for empty vaarg functs
+          }
+          FunctionInnards << ", ...";
+        } else if (!FTy->getNumParams()) {
+          FunctionInnards << "void";
+        }
+        FunctionInnards << ')';
+        printType(Out, FTy->getReturnType(),
+                  /*isSigned=*/PAL.hasAttribute(0, Attribute::SExt), FunctionInnards.str());
+        return Out;
       }
-      if (I != FTy->param_begin())
-        FunctionInnards << ", ";
-      printType(FunctionInnards, ArgTy,
-        /*isSigned=*/PAL.hasAttribute(Idx, Attribute::SExt), "");
-      ++Idx;
-    }
-    if (FTy->isVarArg()) {
-      if (!FTy->getNumParams())
-        FunctionInnards << " int"; //dummy argument for empty vaarg functs
-      FunctionInnards << ", ...";
-    } else if (!FTy->getNumParams()) {
-      FunctionInnards << "void";
-    }
-    FunctionInnards << ')';
-    printType(Out, FTy->getReturnType(),
-      /*isSigned=*/PAL.hasAttribute(0, Attribute::SExt), FunctionInnards.str());
-    return Out;
-  }
-  case Type::StructTyID: {
-    StructType *STy = cast<StructType>(Ty);
-    
-    // Check to see if the type is named.
-    if (!IgnoreName)
-      return Out << getStructName(STy) << ' ' << NameSoFar;
-    Out << "struct\n";
-    Out << NameSoFar + " {\n";
-    unsigned Idx = 0;
-    for (StructType::element_iterator I = STy->element_begin(),
-           E = STy->element_end(); I != E; ++I, ++Idx) {
-      Out << "  ";
+    case Type::StructTyID: {
+        StructType *STy = cast<StructType>(Ty);
+
+        // Check to see if the type is named.
+        if (!IgnoreName) {
+          return Out << getStructName(STy) << ' ' << NameSoFar;
+        }
+        Out << "struct\n";
+        Out << NameSoFar + " {\n";
+        unsigned Idx = 0;
+        for (StructType::element_iterator I = STy->element_begin(),
+             E = STy->element_end(); I != E; ++I, ++Idx) {
+          Out << "  ";
 #if 0
-      printType(Out, *I, false, "field" + utostr(Idx++));
+          printType(Out, *I, false, "field" + utostr(Idx++));
 #endif
-      bool Field_IN = (STy->getNumElements() == 1) ? IgnoreName : false;
-      if ((*I)->isStructTy() && Field_IN) {
-        printType(Out, *I, false, "",
-          Field_IN);
-        Out << "field"+utostr(Idx);
-      } else {
-        printType(Out, *I, false, "field" + utostr(Idx), Field_IN);
+          bool Field_IN = (STy->getNumElements() == 1) ? IgnoreName : false;
+          if ((*I)->isStructTy() && Field_IN) {
+            printType(Out, *I, false, "",
+                      Field_IN);
+            Out << "field" + utostr(Idx);
+          } else {
+            printType(Out, *I, false, "field" + utostr(Idx), Field_IN);
+          }
+          Out << ";\n";
+        }
+        Out << '}';
+        if (STy->isPacked()) {
+          Out << " __attribute__ ((packed))";
+        }
+        return Out;
       }
-      Out << ";\n";
-    }
-    Out << '}';
-    if (STy->isPacked())
-      Out << " __attribute__ ((packed))";
-    return Out;
-  }
 
-  case Type::PointerTyID: {
-    PointerType *PTy = cast<PointerType>(Ty);
-    std::string ptrName = "*" + NameSoFar;
+    case Type::PointerTyID: {
+        PointerType *PTy = cast<PointerType>(Ty);
+        std::string ptrName = "*" + NameSoFar;
 
-    if (PTy->getElementType()->isArrayTy() ||
-        PTy->getElementType()->isVectorTy())
-      ptrName = "(" + ptrName + ")";
+        if (PTy->getElementType()->isArrayTy() ||
+            PTy->getElementType()->isVectorTy()) {
+          ptrName = "(" + ptrName + ")";
+        }
 
-    uint space = PTy->getAddressSpace();
-    // Print the key word of global
-    if (space == 1)
-      Out << " __global ";
-    else if (space == 3)
-      Out << " __local  ";
-      
-    if (!PAL.isEmpty())
-      // Must be a function ptr cast!
-      return printType(Out, PTy->getElementType(), false, ptrName, true, PAL);
-    return printType(Out, PTy->getElementType(), false, ptrName);
-  }
+        uint space = PTy->getAddressSpace();
+        // Print the key word of global
+        if (space == 1) {
+          Out << " __global ";
+        } else if (space == 3) {
+          Out << " __local  ";
+        }
 
-  case Type::ArrayTyID: {
-    ArrayType *ATy = cast<ArrayType>(Ty);
+        if (!PAL.isEmpty())
+          // Must be a function ptr cast!
+        {
+          return printType(Out, PTy->getElementType(), false, ptrName, true, PAL);
+        }
+        return printType(Out, PTy->getElementType(), false, ptrName);
+      }
 
-    // Check to see if the type is named.
-    if (!IgnoreName)
-    {
-       std::vector<Type*> structMembers;
-       structMembers.push_back(ATy);
-       return Out << getStructName(StructType::get(
-       TheModule->getContext(), structMembers)) << ' ' << NameSoFar;
-    }
+    case Type::ArrayTyID: {
+        ArrayType *ATy = cast<ArrayType>(Ty);
 
-    unsigned NumElements = ATy->getNumElements();
-    if (NumElements == 0) NumElements = 1;
-    // Arrays are wrapped in structs to allow them to have normal
-    // value semantics (avoiding the array "decay").
-    Out << " struct { ";
-    printType(Out, ATy->getElementType(), false,
-              "array[" + utostr(NumElements) + "]");
-    return Out << "; }" << NameSoFar << " ";
-  }
+        // Check to see if the type is named.
+        if (!IgnoreName) {
+          std::vector<Type *> structMembers;
+          structMembers.push_back(ATy);
+          return Out << getStructName(StructType::get(
+                                        TheModule->getContext(), structMembers)) << ' ' << NameSoFar;
+        }
 
-  default:
-    llvm_unreachable("Unhandled case in getTypeProps!");
+        unsigned NumElements = ATy->getNumElements();
+        if (NumElements == 0) {
+          NumElements = 1;
+        }
+        // Arrays are wrapped in structs to allow them to have normal
+        // value semantics (avoiding the array "decay").
+        Out << " struct { ";
+        printType(Out, ATy->getElementType(), false,
+                  "array[" + utostr(NumElements) + "]");
+        return Out << "; }" << NameSoFar << " ";
+      }
+
+    default:
+      llvm_unreachable("Unhandled case in getTypeProps!");
   }
 }
 
@@ -611,7 +636,7 @@ void CWriter::printConstantVector(ConstantVector *CP, bool Static) {
 }
 
 void CWriter::printConstantDataSequential(ConstantDataSequential *CDS,
-                                          bool Static) {
+    bool Static) {
   // As a special case, print the array as a string if it is an array of
   // ubytes or an array of sbytes with positive values.
   //
@@ -619,13 +644,13 @@ void CWriter::printConstantDataSequential(ConstantDataSequential *CDS,
     Out << '\"';
     // Keep track of whether the last number was a hexadecimal escape.
     bool LastWasHex = false;
-    
+
     StringRef Bytes = CDS->getAsCString();
-    
+
     // Do not include the last character, which we know is null
     for (unsigned i = 0, e = Bytes.size(); i != e; ++i) {
       unsigned char C = Bytes[i];
-      
+
       // Print it out literally if it is a printable character.  The only thing
       // to be careful about is when the last letter output was a hex escape
       // code, in which case we have to be careful not to print out hex digits
@@ -634,10 +659,11 @@ void CWriter::printConstantDataSequential(ConstantDataSequential *CDS,
       //
       if (isprint(C) && (!LastWasHex || !isxdigit(C))) {
         LastWasHex = false;
-        if (C == '"' || C == '\\')
+        if (C == '"' || C == '\\') {
           Out << "\\" << (char)C;
-        else
+        } else {
           Out << (char)C;
+        }
       } else {
         LastWasHex = false;
         switch (C) {
@@ -650,8 +676,8 @@ void CWriter::printConstantDataSequential(ConstantDataSequential *CDS,
           case '\'': Out << "\\\'"; break;
           default:
             Out << "\\x";
-            Out << (char)(( C/16  < 10) ? ( C/16 +'0') : ( C/16 -10+'A'));
-            Out << (char)(((C&15) < 10) ? ((C&15)+'0') : ((C&15)-10+'A'));
+            Out << (char)((C / 16  < 10) ? (C / 16 + '0') : (C / 16 - 10 + 'A'));
+            Out << (char)(((C & 15) < 10) ? ((C & 15) + '0') : ((C & 15) - 10 + 'A'));
             LastWasHex = true;
             break;
         }
@@ -669,7 +695,7 @@ void CWriter::printConstantDataSequential(ConstantDataSequential *CDS,
   }
 }
 
-static inline std::string ftostr(const APFloat& V) {
+static inline std::string ftostr(const APFloat &V) {
   std::string Buf;
   if (&V.getSemantics() == &APFloat::IEEEdouble) {
     raw_string_ostream(Buf) << V.convertToDouble();
@@ -694,24 +720,28 @@ static bool isFPCSafeToPrint(const ConstantFP *CFP) {
   bool ignored;
   // Do long doubles in hex for now.
   if (CFP->getType() != Type::getFloatTy(CFP->getContext()) &&
-      CFP->getType() != Type::getDoubleTy(CFP->getContext()))
+      CFP->getType() != Type::getDoubleTy(CFP->getContext())) {
     return false;
+  }
   APFloat APF = APFloat(CFP->getValueAPF());  // copy
-  if (CFP->getType() == Type::getFloatTy(CFP->getContext()))
+  if (CFP->getType() == Type::getFloatTy(CFP->getContext())) {
     APF.convert(APFloat::IEEEdouble, APFloat::rmNearestTiesToEven, &ignored);
+  }
 #if HAVE_PRINTF_A && ENABLE_CBE_PRINTF_A
   char Buffer[100];
   sprintf(Buffer, "%a", APF.convertToDouble());
   if (!strncmp(Buffer, "0x", 2) ||
       !strncmp(Buffer, "-0x", 3) ||
-      !strncmp(Buffer, "+0x", 3))
+      !strncmp(Buffer, "+0x", 3)) {
     return APF.bitwiseIsEqual(APFloat(atof(Buffer)));
+  }
   return false;
 #else
   std::string StrVal = ftostr(APF);
 
-  while (StrVal[0] == ' ')
+  while (StrVal[0] == ' ') {
     StrVal.erase(StrVal.begin());
+  }
 
   // Check to make sure that the stringized number is not some string like "Inf"
   // or NaN.  Check that the string matches the "[-+]?[0-9]" regex.
@@ -719,7 +749,9 @@ static bool isFPCSafeToPrint(const ConstantFP *CFP) {
       ((StrVal[0] == '-' || StrVal[0] == '+') &&
        (StrVal[1] >= '0' && StrVal[1] <= '9')))
     // Reparse stringized version!
+  {
     return APF.bitwiseIsEqual(APFloat(atof(StrVal.c_str())));
+  }
   return false;
 #endif
 }
@@ -793,160 +825,161 @@ void CWriter::printCast(unsigned opc, Type *SrcTy, Type *DstTy) {
 void CWriter::printConstant(Constant *CPV, bool Static) {
   if (const ConstantExpr *CE = dyn_cast<ConstantExpr>(CPV)) {
     switch (CE->getOpcode()) {
-    case Instruction::Trunc:
-    case Instruction::ZExt:
-    case Instruction::SExt:
-    case Instruction::FPTrunc:
-    case Instruction::FPExt:
-    case Instruction::UIToFP:
-    case Instruction::SIToFP:
-    case Instruction::FPToUI:
-    case Instruction::FPToSI:
-    case Instruction::PtrToInt:
-    case Instruction::IntToPtr:
-    case Instruction::BitCast:
-      Out << "(";
-      printCast(CE->getOpcode(), CE->getOperand(0)->getType(), CE->getType());
-      if (CE->getOpcode() == Instruction::SExt &&
-          CE->getOperand(0)->getType() == Type::getInt1Ty(CPV->getContext())) {
-        // Make sure we really sext from bool here by subtracting from 0
-        Out << "0-";
-      }
-      printConstant(CE->getOperand(0), Static);
-      if (CE->getType() == Type::getInt1Ty(CPV->getContext()) &&
-          (CE->getOpcode() == Instruction::Trunc ||
-           CE->getOpcode() == Instruction::FPToUI ||
-           CE->getOpcode() == Instruction::FPToSI ||
-           CE->getOpcode() == Instruction::PtrToInt)) {
-        // Make sure we really truncate to bool here by anding with 1
-        Out << "&1u";
-      }
-      Out << ')';
-      return;
+      case Instruction::Trunc:
+      case Instruction::ZExt:
+      case Instruction::SExt:
+      case Instruction::FPTrunc:
+      case Instruction::FPExt:
+      case Instruction::UIToFP:
+      case Instruction::SIToFP:
+      case Instruction::FPToUI:
+      case Instruction::FPToSI:
+      case Instruction::PtrToInt:
+      case Instruction::IntToPtr:
+      case Instruction::BitCast:
+        Out << "(";
+        printCast(CE->getOpcode(), CE->getOperand(0)->getType(), CE->getType());
+        if (CE->getOpcode() == Instruction::SExt &&
+            CE->getOperand(0)->getType() == Type::getInt1Ty(CPV->getContext())) {
+          // Make sure we really sext from bool here by subtracting from 0
+          Out << "0-";
+        }
+        printConstant(CE->getOperand(0), Static);
+        if (CE->getType() == Type::getInt1Ty(CPV->getContext()) &&
+            (CE->getOpcode() == Instruction::Trunc ||
+             CE->getOpcode() == Instruction::FPToUI ||
+             CE->getOpcode() == Instruction::FPToSI ||
+             CE->getOpcode() == Instruction::PtrToInt)) {
+          // Make sure we really truncate to bool here by anding with 1
+          Out << "&1u";
+        }
+        Out << ')';
+        return;
 
-    case Instruction::GetElementPtr:
-      Out << "(";
-      printGEPExpression(CE->getOperand(0), gep_type_begin(CPV),
-                         gep_type_end(CPV), Static);
-      Out << ")";
-      return;
-    case Instruction::Select:
-      Out << '(';
-      printConstant(CE->getOperand(0), Static);
-      Out << '?';
-      printConstant(CE->getOperand(1), Static);
-      Out << ':';
-      printConstant(CE->getOperand(2), Static);
-      Out << ')';
-      return;
-    case Instruction::Add:
-    case Instruction::FAdd:
-    case Instruction::Sub:
-    case Instruction::FSub:
-    case Instruction::Mul:
-    case Instruction::FMul:
-    case Instruction::SDiv:
-    case Instruction::UDiv:
-    case Instruction::FDiv:
-    case Instruction::URem:
-    case Instruction::SRem:
-    case Instruction::FRem:
-    case Instruction::And:
-    case Instruction::Or:
-    case Instruction::Xor:
-    case Instruction::ICmp:
-    case Instruction::Shl:
-    case Instruction::LShr:
-    case Instruction::AShr:
-    {
-      Out << '(';
-      bool NeedsClosingParens = printConstExprCast(CE, Static);
-      printConstantWithCast(CE->getOperand(0), CE->getOpcode());
-      switch (CE->getOpcode()) {
+      case Instruction::GetElementPtr:
+        Out << "(";
+        printGEPExpression(CE->getOperand(0), gep_type_begin(CPV),
+                           gep_type_end(CPV), Static);
+        Out << ")";
+        return;
+      case Instruction::Select:
+        Out << '(';
+        printConstant(CE->getOperand(0), Static);
+        Out << '?';
+        printConstant(CE->getOperand(1), Static);
+        Out << ':';
+        printConstant(CE->getOperand(2), Static);
+        Out << ')';
+        return;
       case Instruction::Add:
-      case Instruction::FAdd: Out << " + "; break;
+      case Instruction::FAdd:
       case Instruction::Sub:
-      case Instruction::FSub: Out << " - "; break;
+      case Instruction::FSub:
       case Instruction::Mul:
-      case Instruction::FMul: Out << " * "; break;
+      case Instruction::FMul:
+      case Instruction::SDiv:
+      case Instruction::UDiv:
+      case Instruction::FDiv:
       case Instruction::URem:
       case Instruction::SRem:
-      case Instruction::FRem: Out << " % "; break;
-      case Instruction::UDiv:
-      case Instruction::SDiv:
-      case Instruction::FDiv: Out << " / "; break;
-      case Instruction::And: Out << " & "; break;
-      case Instruction::Or:  Out << " | "; break;
-      case Instruction::Xor: Out << " ^ "; break;
-      case Instruction::Shl: Out << " << "; break;
-      case Instruction::LShr:
-      case Instruction::AShr: Out << " >> "; break;
+      case Instruction::FRem:
+      case Instruction::And:
+      case Instruction::Or:
+      case Instruction::Xor:
       case Instruction::ICmp:
-        switch (CE->getPredicate()) {
-          case ICmpInst::ICMP_EQ: Out << " == "; break;
-          case ICmpInst::ICMP_NE: Out << " != "; break;
-          case ICmpInst::ICMP_SLT:
-          case ICmpInst::ICMP_ULT: Out << " < "; break;
-          case ICmpInst::ICMP_SLE:
-          case ICmpInst::ICMP_ULE: Out << " <= "; break;
-          case ICmpInst::ICMP_SGT:
-          case ICmpInst::ICMP_UGT: Out << " > "; break;
-          case ICmpInst::ICMP_SGE:
-          case ICmpInst::ICMP_UGE: Out << " >= "; break;
-          default: llvm_unreachable("Illegal ICmp predicate");
+      case Instruction::Shl:
+      case Instruction::LShr:
+      case Instruction::AShr: {
+          Out << '(';
+          bool NeedsClosingParens = printConstExprCast(CE, Static);
+          printConstantWithCast(CE->getOperand(0), CE->getOpcode());
+          switch (CE->getOpcode()) {
+            case Instruction::Add:
+            case Instruction::FAdd: Out << " + "; break;
+            case Instruction::Sub:
+            case Instruction::FSub: Out << " - "; break;
+            case Instruction::Mul:
+            case Instruction::FMul: Out << " * "; break;
+            case Instruction::URem:
+            case Instruction::SRem:
+            case Instruction::FRem: Out << " % "; break;
+            case Instruction::UDiv:
+            case Instruction::SDiv:
+            case Instruction::FDiv: Out << " / "; break;
+            case Instruction::And: Out << " & "; break;
+            case Instruction::Or:  Out << " | "; break;
+            case Instruction::Xor: Out << " ^ "; break;
+            case Instruction::Shl: Out << " << "; break;
+            case Instruction::LShr:
+            case Instruction::AShr: Out << " >> "; break;
+            case Instruction::ICmp:
+              switch (CE->getPredicate()) {
+                case ICmpInst::ICMP_EQ: Out << " == "; break;
+                case ICmpInst::ICMP_NE: Out << " != "; break;
+                case ICmpInst::ICMP_SLT:
+                case ICmpInst::ICMP_ULT: Out << " < "; break;
+                case ICmpInst::ICMP_SLE:
+                case ICmpInst::ICMP_ULE: Out << " <= "; break;
+                case ICmpInst::ICMP_SGT:
+                case ICmpInst::ICMP_UGT: Out << " > "; break;
+                case ICmpInst::ICMP_SGE:
+                case ICmpInst::ICMP_UGE: Out << " >= "; break;
+                default: llvm_unreachable("Illegal ICmp predicate");
+              }
+              break;
+            default: llvm_unreachable("Illegal opcode here!");
+          }
+          printConstantWithCast(CE->getOperand(1), CE->getOpcode());
+          if (NeedsClosingParens) {
+            Out << "))";
+          }
+          Out << ')';
+          return;
         }
-        break;
-      default: llvm_unreachable("Illegal opcode here!");
-      }
-      printConstantWithCast(CE->getOperand(1), CE->getOpcode());
-      if (NeedsClosingParens)
-        Out << "))";
-      Out << ')';
-      return;
-    }
-    case Instruction::FCmp: {
-      Out << '(';
-      bool NeedsClosingParens = printConstExprCast(CE, Static);
-      if (CE->getPredicate() == FCmpInst::FCMP_FALSE)
-        Out << "0";
-      else if (CE->getPredicate() == FCmpInst::FCMP_TRUE)
-        Out << "1";
-      else {
-        const char* op = 0;
-        switch (CE->getPredicate()) {
-        default: llvm_unreachable("Illegal FCmp predicate");
-        case FCmpInst::FCMP_ORD: op = "ord"; break;
-        case FCmpInst::FCMP_UNO: op = "uno"; break;
-        case FCmpInst::FCMP_UEQ: op = "ueq"; break;
-        case FCmpInst::FCMP_UNE: op = "une"; break;
-        case FCmpInst::FCMP_ULT: op = "ult"; break;
-        case FCmpInst::FCMP_ULE: op = "ule"; break;
-        case FCmpInst::FCMP_UGT: op = "ugt"; break;
-        case FCmpInst::FCMP_UGE: op = "uge"; break;
-        case FCmpInst::FCMP_OEQ: op = "oeq"; break;
-        case FCmpInst::FCMP_ONE: op = "one"; break;
-        case FCmpInst::FCMP_OLT: op = "olt"; break;
-        case FCmpInst::FCMP_OLE: op = "ole"; break;
-        case FCmpInst::FCMP_OGT: op = "ogt"; break;
-        case FCmpInst::FCMP_OGE: op = "oge"; break;
+      case Instruction::FCmp: {
+          Out << '(';
+          bool NeedsClosingParens = printConstExprCast(CE, Static);
+          if (CE->getPredicate() == FCmpInst::FCMP_FALSE) {
+            Out << "0";
+          } else if (CE->getPredicate() == FCmpInst::FCMP_TRUE) {
+            Out << "1";
+          } else {
+            const char *op = 0;
+            switch (CE->getPredicate()) {
+              default: llvm_unreachable("Illegal FCmp predicate");
+              case FCmpInst::FCMP_ORD: op = "ord"; break;
+              case FCmpInst::FCMP_UNO: op = "uno"; break;
+              case FCmpInst::FCMP_UEQ: op = "ueq"; break;
+              case FCmpInst::FCMP_UNE: op = "une"; break;
+              case FCmpInst::FCMP_ULT: op = "ult"; break;
+              case FCmpInst::FCMP_ULE: op = "ule"; break;
+              case FCmpInst::FCMP_UGT: op = "ugt"; break;
+              case FCmpInst::FCMP_UGE: op = "uge"; break;
+              case FCmpInst::FCMP_OEQ: op = "oeq"; break;
+              case FCmpInst::FCMP_ONE: op = "one"; break;
+              case FCmpInst::FCMP_OLT: op = "olt"; break;
+              case FCmpInst::FCMP_OLE: op = "ole"; break;
+              case FCmpInst::FCMP_OGT: op = "ogt"; break;
+              case FCmpInst::FCMP_OGE: op = "oge"; break;
+            }
+            Out << "llvm_fcmp_" << op << "(";
+            printConstantWithCast(CE->getOperand(0), CE->getOpcode());
+            Out << ", ";
+            printConstantWithCast(CE->getOperand(1), CE->getOpcode());
+            Out << ")";
+          }
+          if (NeedsClosingParens) {
+            Out << "))";
+          }
+          Out << ')';
+          return;
         }
-        Out << "llvm_fcmp_" << op << "(";
-        printConstantWithCast(CE->getOperand(0), CE->getOpcode());
-        Out << ", ";
-        printConstantWithCast(CE->getOperand(1), CE->getOpcode());
-        Out << ")";
-      }
-      if (NeedsClosingParens)
-        Out << "))";
-      Out << ')';
-      return;
-    }
-    default:
+      default:
 #ifndef NDEBUG
-      errs() << "CWriter Error: Unhandled constant expression: "
-           << *CE << "\n";
+        errs() << "CWriter Error: Unhandled constant expression: "
+               << *CE << "\n";
 #endif
-      llvm_unreachable(0);
+        llvm_unreachable(0);
     }
   } else if (isa<UndefValue>(CPV) && CPV->getType()->isSingleValueType()) {
     Out << "((";
@@ -961,266 +994,270 @@ void CWriter::printConstant(Constant *CPV, bool Static) {
   }
 
   if (ConstantInt *CI = dyn_cast<ConstantInt>(CPV)) {
-    Type* Ty = CI->getType();
-    if (Ty == Type::getInt1Ty(CPV->getContext()))
+    Type *Ty = CI->getType();
+    if (Ty == Type::getInt1Ty(CPV->getContext())) {
       Out << (CI->getZExtValue() ? '1' : '0');
-    else if (Ty == Type::getInt32Ty(CPV->getContext()))
+    } else if (Ty == Type::getInt32Ty(CPV->getContext())) {
       Out << CI->getZExtValue() << 'u';
-    else if (Ty->getPrimitiveSizeInBits() > 32)
+    } else if (Ty->getPrimitiveSizeInBits() > 32) {
       Out << CI->getZExtValue() << "ul";
-    else {
+    } else {
       Out << "((";
       printSimpleType(Out, Ty, false) << ')';
-      if (CI->isMinValue(true))
+      if (CI->isMinValue(true)) {
         Out << CI->getZExtValue() << 'u';
-      else
+      } else {
         Out << CI->getSExtValue();
+      }
       Out << ')';
     }
     return;
   }
 
   switch (CPV->getType()->getTypeID()) {
-  case Type::FloatTyID:
-  case Type::DoubleTyID:
-  case Type::X86_FP80TyID:
-  case Type::PPC_FP128TyID:
-  case Type::FP128TyID: {
-    ConstantFP *FPC = cast<ConstantFP>(CPV);
-    std::map<const ConstantFP*, unsigned>::iterator I = FPConstantMap.find(FPC);
-    if (I != FPConstantMap.end()) {
-      // Because of FP precision problems we must load from a stack allocated
-      // value that holds the value in hex.
-      Out << "\n#ifdef __OPENCL_VERSION__\n";
-      Out << "(*(" << (FPC->getType() == Type::getFloatTy(CPV->getContext()) ?
-                       "__constant float" :
-                       "__constant double" )
-          << "*)&FPConstant" << I->second << ')';
-      Out << "\n#else\n";
-      Out << "(*(" << (FPC->getType() == Type::getFloatTy(CPV->getContext()) ?
-                       "float" :
-                       FPC->getType() == Type::getDoubleTy(CPV->getContext()) ?
-                       "double" :
-                       "long double")
-          << "*)&FPConstant" << I->second << ')';
-      Out << "\n#endif\n";
-    } else {
-      double V;
-      if (FPC->getType() == Type::getFloatTy(CPV->getContext()))
-        V = FPC->getValueAPF().convertToFloat();
-      else if (FPC->getType() == Type::getDoubleTy(CPV->getContext()))
-        V = FPC->getValueAPF().convertToDouble();
-      else {
-        // Long double.  Convert the number to double, discarding precision.
-        // This is not awesome, but it at least makes the CBE output somewhat
-        // useful.
-        APFloat Tmp = FPC->getValueAPF();
-        bool LosesInfo;
-        Tmp.convert(APFloat::IEEEdouble, APFloat::rmTowardZero, &LosesInfo);
-        V = Tmp.convertToDouble();
-      }
+    case Type::FloatTyID:
+    case Type::DoubleTyID:
+    case Type::X86_FP80TyID:
+    case Type::PPC_FP128TyID:
+    case Type::FP128TyID: {
+        ConstantFP *FPC = cast<ConstantFP>(CPV);
+        std::map<const ConstantFP *, unsigned>::iterator I = FPConstantMap.find(FPC);
+        if (I != FPConstantMap.end()) {
+          // Because of FP precision problems we must load from a stack allocated
+          // value that holds the value in hex.
+          Out << "\n#ifdef __OPENCL_VERSION__\n";
+          Out << "(*(" << (FPC->getType() == Type::getFloatTy(CPV->getContext()) ?
+                           "__constant float" :
+                           "__constant double")
+              << "*)&FPConstant" << I->second << ')';
+          Out << "\n#else\n";
+          Out << "(*(" << (FPC->getType() == Type::getFloatTy(CPV->getContext()) ?
+                           "float" :
+                           FPC->getType() == Type::getDoubleTy(CPV->getContext()) ?
+                           "double" :
+                           "long double")
+              << "*)&FPConstant" << I->second << ')';
+          Out << "\n#endif\n";
+        } else {
+          double V;
+          if (FPC->getType() == Type::getFloatTy(CPV->getContext())) {
+            V = FPC->getValueAPF().convertToFloat();
+          } else if (FPC->getType() == Type::getDoubleTy(CPV->getContext())) {
+            V = FPC->getValueAPF().convertToDouble();
+          } else {
+            // Long double.  Convert the number to double, discarding precision.
+            // This is not awesome, but it at least makes the CBE output somewhat
+            // useful.
+            APFloat Tmp = FPC->getValueAPF();
+            bool LosesInfo;
+            Tmp.convert(APFloat::IEEEdouble, APFloat::rmTowardZero, &LosesInfo);
+            V = Tmp.convertToDouble();
+          }
 
-      if (IsNAN(V)) {
-        // The value is NaN
+          if (IsNAN(V)) {
+            // The value is NaN
 
-        // FIXME the actual NaN bits should be emitted.
-        // The prefix for a quiet NaN is 0x7FF8. For a signalling NaN,
-        // it's 0x7ff4.
-        const unsigned long QuietNaN = 0x7ff8UL;
-        //const unsigned long SignalNaN = 0x7ff4UL;
+            // FIXME the actual NaN bits should be emitted.
+            // The prefix for a quiet NaN is 0x7FF8. For a signalling NaN,
+            // it's 0x7ff4.
+            const unsigned long QuietNaN = 0x7ff8UL;
+            //const unsigned long SignalNaN = 0x7ff4UL;
 
-        // We need to grab the first part of the FP #
-        char Buffer[100];
+            // We need to grab the first part of the FP #
+            char Buffer[100];
 
-        uint64_t ll = DoubleToBits(V);
-        sprintf(Buffer, "0x%llx", static_cast<long long>(ll));
+            uint64_t ll = DoubleToBits(V);
+            sprintf(Buffer, "0x%llx", static_cast<long long>(ll));
 
-        std::string Num(&Buffer[0], &Buffer[6]);
-        unsigned long Val = strtoul(Num.c_str(), 0, 16);
+            std::string Num(&Buffer[0], &Buffer[6]);
+            unsigned long Val = strtoul(Num.c_str(), 0, 16);
 
-        if (FPC->getType() == Type::getFloatTy(FPC->getContext()))
-          Out << "LLVM_NAN" << (Val == QuietNaN ? "" : "S") << "F(\""
-              << Buffer << "\") /*nan*/ ";
-        else
-          Out << "LLVM_NAN" << (Val == QuietNaN ? "" : "S") << "(\""
-              << Buffer << "\") /*nan*/ ";
-      } else if (IsInf(V)) {
-        // The value is Inf
-        if (V < 0) Out << '-';
-        Out << "LLVM_INF" <<
-            (FPC->getType() == Type::getFloatTy(FPC->getContext()) ? "F" : "")
-            << " /*inf*/ ";
-      } else {
-        std::string Num;
+            if (FPC->getType() == Type::getFloatTy(FPC->getContext()))
+              Out << "LLVM_NAN" << (Val == QuietNaN ? "" : "S") << "F(\""
+                  << Buffer << "\") /*nan*/ ";
+            else
+              Out << "LLVM_NAN" << (Val == QuietNaN ? "" : "S") << "(\""
+                  << Buffer << "\") /*nan*/ ";
+          } else if (IsInf(V)) {
+            // The value is Inf
+            if (V < 0) {
+              Out << '-';
+            }
+            Out << "LLVM_INF" <<
+                (FPC->getType() == Type::getFloatTy(FPC->getContext()) ? "F" : "")
+                << " /*inf*/ ";
+          } else {
+            std::string Num;
 #if HAVE_PRINTF_A && ENABLE_CBE_PRINTF_A
-        // Print out the constant as a floating point number.
-        char Buffer[100];
-        sprintf(Buffer, "%a", V);
-        Num = Buffer;
+            // Print out the constant as a floating point number.
+            char Buffer[100];
+            sprintf(Buffer, "%a", V);
+            Num = Buffer;
 #else
-        Num = ftostr(FPC->getValueAPF());
+            Num = ftostr(FPC->getValueAPF());
 #endif
-       Out << Num;
+            Out << Num;
+          }
+        }
+        break;
       }
-    }
-    break;
-  }
 
-  case Type::ArrayTyID:
-    // Use C99 compound expression literal initializer syntax.
-    if (!Static) {
-      Out << "(";
-      printType(Out, CPV->getType());
-      Out << ")";
-    }
-    Out << " { { "; // Arrays are wrapped in struct types.
-    if (ConstantArray *CA = dyn_cast<ConstantArray>(CPV)) {
-      printConstantArray(CA, Static);
-    } else if (ConstantDataSequential *CDS = 
-                 dyn_cast<ConstantDataSequential>(CPV)) {
-      printConstantDataSequential(CDS, Static);
-    } else {
-      assert(isa<ConstantAggregateZero>(CPV) || isa<UndefValue>(CPV));
-      ArrayType *AT = cast<ArrayType>(CPV->getType());
-      Out << '{';
-      if (AT->getNumElements()) {
-        Out << ' ';
-        Constant *CZ = Constant::getNullValue(AT->getElementType());
+    case Type::ArrayTyID:
+      // Use C99 compound expression literal initializer syntax.
+      if (!Static) {
+        Out << "(";
+        printType(Out, CPV->getType());
+        Out << ")";
+      }
+      Out << " { { "; // Arrays are wrapped in struct types.
+      if (ConstantArray *CA = dyn_cast<ConstantArray>(CPV)) {
+        printConstantArray(CA, Static);
+      } else if (ConstantDataSequential *CDS =
+                   dyn_cast<ConstantDataSequential>(CPV)) {
+        printConstantDataSequential(CDS, Static);
+      } else {
+        assert(isa<ConstantAggregateZero>(CPV) || isa<UndefValue>(CPV));
+        ArrayType *AT = cast<ArrayType>(CPV->getType());
+        Out << '{';
+        if (AT->getNumElements()) {
+          Out << ' ';
+          Constant *CZ = Constant::getNullValue(AT->getElementType());
+          printConstant(CZ, Static);
+          for (unsigned i = 1, e = AT->getNumElements(); i != e; ++i) {
+            Out << ", ";
+            printConstant(CZ, Static);
+          }
+        }
+        Out << " }";
+      }
+      Out << " } }"; // Arrays are wrapped in struct types.
+      break;
+
+    case Type::VectorTyID:
+      // Use C99 compound expression literal initializer syntax.
+      if (!Static) {
+        Out << "(";
+        printType(Out, CPV->getType());
+        Out << ")";
+      }
+      if (ConstantVector *CV = dyn_cast<ConstantVector>(CPV)) {
+        printConstantVector(CV, Static);
+      } else if (ConstantDataSequential *CDS =
+                   dyn_cast<ConstantDataSequential>(CPV)) {
+        printConstantDataSequential(CDS, Static);
+      } else {
+        assert(isa<ConstantAggregateZero>(CPV) || isa<UndefValue>(CPV));
+        VectorType *VT = cast<VectorType>(CPV->getType());
+        Out << "{ ";
+        Constant *CZ = Constant::getNullValue(VT->getElementType());
         printConstant(CZ, Static);
-        for (unsigned i = 1, e = AT->getNumElements(); i != e; ++i) {
+        for (unsigned i = 1, e = VT->getNumElements(); i != e; ++i) {
           Out << ", ";
           printConstant(CZ, Static);
         }
+        Out << " }";
       }
-      Out << " }";
-    }
-    Out << " } }"; // Arrays are wrapped in struct types.
-    break;
-
-  case Type::VectorTyID:
-    // Use C99 compound expression literal initializer syntax.
-    if (!Static) {
-      Out << "(";
-      printType(Out, CPV->getType());
-      Out << ")";
-    }
-    if (ConstantVector *CV = dyn_cast<ConstantVector>(CPV)) {
-      printConstantVector(CV, Static);
-    } else if (ConstantDataSequential *CDS = 
-               dyn_cast<ConstantDataSequential>(CPV)) {
-      printConstantDataSequential(CDS, Static);
-    } else {
-      assert(isa<ConstantAggregateZero>(CPV) || isa<UndefValue>(CPV));
-      VectorType *VT = cast<VectorType>(CPV->getType());
-      Out << "{ ";
-      Constant *CZ = Constant::getNullValue(VT->getElementType());
-      printConstant(CZ, Static);
-      for (unsigned i = 1, e = VT->getNumElements(); i != e; ++i) {
-        Out << ", ";
-        printConstant(CZ, Static);
-      }
-      Out << " }";
-    }
-    break;
-
-  case Type::StructTyID:
-    // Use C99 compound expression literal initializer syntax.
-    if (!Static) {
-      Out << "(";
-      printType(Out, CPV->getType());
-      Out << ")";
-    }
-    if (isa<ConstantAggregateZero>(CPV) || isa<UndefValue>(CPV)) {
-      StructType *ST = cast<StructType>(CPV->getType());
-      Out << '{';
-      if (ST->getNumElements()) {
-        Out << ' ';
-        printConstant(Constant::getNullValue(ST->getElementType(0)), Static);
-        for (unsigned i = 1, e = ST->getNumElements(); i != e; ++i) {
-          Out << ", ";
-          printConstant(Constant::getNullValue(ST->getElementType(i)), Static);
-        }
-      }
-      Out << " }";
-    } else {
-      Out << '{';
-      if (CPV->getNumOperands()) {
-        Out << ' ';
-        printConstant(cast<Constant>(CPV->getOperand(0)), Static);
-        for (unsigned i = 1, e = CPV->getNumOperands(); i != e; ++i) {
-          Out << ", ";
-          printConstant(cast<Constant>(CPV->getOperand(i)), Static);
-        }
-      }
-      Out << " }";
-    }
-    break;
-
-  case Type::PointerTyID:
-    if (isa<ConstantPointerNull>(CPV)) {
-      Out << "((";
-      printType(Out, CPV->getType()); // sign doesn't matter
-      Out << ")/*NULL*/0)";
       break;
-    } else if (GlobalValue *GV = dyn_cast<GlobalValue>(CPV)) {
-      writeOperand(GV, Static);
+
+    case Type::StructTyID:
+      // Use C99 compound expression literal initializer syntax.
+      if (!Static) {
+        Out << "(";
+        printType(Out, CPV->getType());
+        Out << ")";
+      }
+      if (isa<ConstantAggregateZero>(CPV) || isa<UndefValue>(CPV)) {
+        StructType *ST = cast<StructType>(CPV->getType());
+        Out << '{';
+        if (ST->getNumElements()) {
+          Out << ' ';
+          printConstant(Constant::getNullValue(ST->getElementType(0)), Static);
+          for (unsigned i = 1, e = ST->getNumElements(); i != e; ++i) {
+            Out << ", ";
+            printConstant(Constant::getNullValue(ST->getElementType(i)), Static);
+          }
+        }
+        Out << " }";
+      } else {
+        Out << '{';
+        if (CPV->getNumOperands()) {
+          Out << ' ';
+          printConstant(cast<Constant>(CPV->getOperand(0)), Static);
+          for (unsigned i = 1, e = CPV->getNumOperands(); i != e; ++i) {
+            Out << ", ";
+            printConstant(cast<Constant>(CPV->getOperand(i)), Static);
+          }
+        }
+        Out << " }";
+      }
       break;
-    }
-    // FALL THROUGH
-  default:
+
+    case Type::PointerTyID:
+      if (isa<ConstantPointerNull>(CPV)) {
+        Out << "((";
+        printType(Out, CPV->getType()); // sign doesn't matter
+        Out << ")/*NULL*/0)";
+        break;
+      } else if (GlobalValue *GV = dyn_cast<GlobalValue>(CPV)) {
+        writeOperand(GV, Static);
+        break;
+      }
+      // FALL THROUGH
+    default:
 #ifndef NDEBUG
-    errs() << "Unknown constant type: " << *CPV << "\n";
+      errs() << "Unknown constant type: " << *CPV << "\n";
 #endif
-    llvm_unreachable(0);
+      llvm_unreachable(0);
   }
 }
 
 // Some constant expressions need to be casted back to the original types
 // because their operands were casted to the expected type. This function takes
 // care of detecting that case and printing the cast for the ConstantExpr.
-bool CWriter::printConstExprCast(const ConstantExpr* CE, bool Static) {
+bool CWriter::printConstExprCast(const ConstantExpr *CE, bool Static) {
   bool NeedsExplicitCast = false;
   Type *Ty = CE->getOperand(0)->getType();
   bool TypeIsSigned = false;
   switch (CE->getOpcode()) {
-  case Instruction::Add:
-  case Instruction::Sub:
-  case Instruction::Mul:
-    // We need to cast integer arithmetic so that it is always performed
-    // as unsigned, to avoid undefined behavior on overflow.
-  case Instruction::LShr:
-  case Instruction::URem:
-  case Instruction::UDiv: NeedsExplicitCast = true; break;
-  case Instruction::AShr:
-  case Instruction::SRem:
-  case Instruction::SDiv: NeedsExplicitCast = true; TypeIsSigned = true; break;
-  case Instruction::SExt:
-    Ty = CE->getType();
-    NeedsExplicitCast = true;
-    TypeIsSigned = true;
-    break;
-  case Instruction::ZExt:
-  case Instruction::Trunc:
-  case Instruction::FPTrunc:
-  case Instruction::FPExt:
-  case Instruction::UIToFP:
-  case Instruction::SIToFP:
-  case Instruction::FPToUI:
-  case Instruction::FPToSI:
-  case Instruction::PtrToInt:
-  case Instruction::IntToPtr:
-  case Instruction::BitCast:
-    Ty = CE->getType();
-    NeedsExplicitCast = true;
-    break;
-  default: break;
+    case Instruction::Add:
+    case Instruction::Sub:
+    case Instruction::Mul:
+      // We need to cast integer arithmetic so that it is always performed
+      // as unsigned, to avoid undefined behavior on overflow.
+    case Instruction::LShr:
+    case Instruction::URem:
+    case Instruction::UDiv: NeedsExplicitCast = true; break;
+    case Instruction::AShr:
+    case Instruction::SRem:
+    case Instruction::SDiv: NeedsExplicitCast = true; TypeIsSigned = true; break;
+    case Instruction::SExt:
+      Ty = CE->getType();
+      NeedsExplicitCast = true;
+      TypeIsSigned = true;
+      break;
+    case Instruction::ZExt:
+    case Instruction::Trunc:
+    case Instruction::FPTrunc:
+    case Instruction::FPExt:
+    case Instruction::UIToFP:
+    case Instruction::SIToFP:
+    case Instruction::FPToUI:
+    case Instruction::FPToSI:
+    case Instruction::PtrToInt:
+    case Instruction::IntToPtr:
+    case Instruction::BitCast:
+      Ty = CE->getType();
+      NeedsExplicitCast = true;
+      break;
+    default: break;
   }
   if (NeedsExplicitCast) {
     Out << "((";
-    if (Ty->isIntegerTy() && Ty != Type::getInt1Ty(Ty->getContext()))
+    if (Ty->isIntegerTy() && Ty != Type::getInt1Ty(Ty->getContext())) {
       printSimpleType(Out, Ty, TypeIsSigned);
-    else
-      printType(Out, Ty); // not integer, sign doesn't matter
+    } else {
+      printType(Out, Ty);  // not integer, sign doesn't matter
+    }
     Out << ")(";
   }
   return NeedsExplicitCast;
@@ -1229,10 +1266,10 @@ bool CWriter::printConstExprCast(const ConstantExpr* CE, bool Static) {
 //  Print a constant assuming that it is the operand for a given Opcode. The
 //  opcodes that care about sign need to cast their operands to the expected
 //  type before the operation proceeds. This function does the casting.
-void CWriter::printConstantWithCast(Constant* CPV, unsigned Opcode) {
+void CWriter::printConstantWithCast(Constant *CPV, unsigned Opcode) {
 
   // Extract the operand's type, we'll need it.
-  Type* OpTy = CPV->getType();
+  Type *OpTy = CPV->getType();
 
   // Indicate whether to do the cast or not.
   bool shouldCast = false;
@@ -1272,8 +1309,9 @@ void CWriter::printConstantWithCast(Constant* CPV, unsigned Opcode) {
     Out << ")";
     printConstant(CPV, false);
     Out << ")";
-  } else
+  } else {
     printConstant(CPV, false);
+  }
 }
 
 std::string CWriter::GetValueName(const Value *Operand) {
@@ -1282,8 +1320,9 @@ std::string CWriter::GetValueName(const Value *Operand) {
   // To Ensure
   // Resolve potential alias.
   if (const GlobalAlias *GA = dyn_cast<GlobalAlias>(Operand)) {
-    if (const Value *V = GA->resolveAliasedGlobal(false))
+    if (const Value *V = GA->resolveAliasedGlobal(false)) {
       Operand = V;
+    }
   }
 #endif
 
@@ -1298,8 +1337,9 @@ std::string CWriter::GetValueName(const Value *Operand) {
 
   if (Name.empty()) { // Assign unique names to local temporaries.
     unsigned &No = AnonValueNumbers[Operand];
-    if (No == 0)
+    if (No == 0) {
       No = ++NextAnonValueNumber;
+    }
     Name = "tmp__" + utostr(No);
   }
 
@@ -1315,8 +1355,9 @@ std::string CWriter::GetValueName(const Value *Operand) {
       char buffer[5];
       sprintf(buffer, "_%x_", ch);
       VarName += buffer;
-    } else
+    } else {
       VarName += ch;
+    }
   }
 
   return "llvm_cbe_" + VarName;
@@ -1328,14 +1369,14 @@ void CWriter::writeInstComputationInline(Instruction &I) {
   // We can't currently support integer types other than 1, 8, 16, 32, 64.
   // Validate this.
   Type *Ty = I.getType();
-  if (Ty->isIntegerTy() && (Ty!=Type::getInt1Ty(I.getContext()) &&
-        Ty!=Type::getInt8Ty(I.getContext()) &&
-        Ty!=Type::getInt16Ty(I.getContext()) &&
-        Ty!=Type::getInt32Ty(I.getContext()) &&
-        Ty!=Type::getInt64Ty(I.getContext()))) {
-      report_fatal_error("The C backend does not currently support integer "
-                        "types of widths other than 1, 8, 16, 32, 64.\n"
-                        "This is being tracked as PR 4158.");
+  if (Ty->isIntegerTy() && (Ty != Type::getInt1Ty(I.getContext()) &&
+                            Ty != Type::getInt8Ty(I.getContext()) &&
+                            Ty != Type::getInt16Ty(I.getContext()) &&
+                            Ty != Type::getInt32Ty(I.getContext()) &&
+                            Ty != Type::getInt64Ty(I.getContext()))) {
+    report_fatal_error("The C backend does not currently support integer "
+                       "types of widths other than 1, 8, 16, 32, 64.\n"
+                       "This is being tracked as PR 4158.");
   }
 
   // If this is a non-trivial bool computation, make sure to truncate down to
@@ -1343,16 +1384,19 @@ void CWriter::writeInstComputationInline(Instruction &I) {
   // "0" when x and y are true, not "2" for example.
   bool NeedBoolTrunc = false;
   if (I.getType() == Type::getInt1Ty(I.getContext()) &&
-      !isa<ICmpInst>(I) && !isa<FCmpInst>(I))
+      !isa<ICmpInst>(I) && !isa<FCmpInst>(I)) {
     NeedBoolTrunc = true;
+  }
 
-  if (NeedBoolTrunc)
+  if (NeedBoolTrunc) {
     Out << "((";
+  }
 
   visit(I);
 
-  if (NeedBoolTrunc)
+  if (NeedBoolTrunc) {
     Out << ")&1)";
+  }
 }
 
 
@@ -1366,23 +1410,26 @@ void CWriter::writeOperandInternal(Value *Operand, bool Static) {
       return;
     }
 
-  Constant* CPV = dyn_cast<Constant>(Operand);
+  Constant *CPV = dyn_cast<Constant>(Operand);
 
-  if (CPV && !isa<GlobalValue>(CPV))
+  if (CPV && !isa<GlobalValue>(CPV)) {
     printConstant(CPV, Static);
-  else
+  } else {
     Out << GetValueName(Operand);
+  }
 }
 
 void CWriter::writeOperand(Value *Operand, bool Static) {
   bool isAddressImplicit = isAddressExposed(Operand);
-  if (isAddressImplicit)
+  if (isAddressImplicit) {
     Out << "(&";  // Global variables are referenced as their addresses by llvm
+  }
 
   writeOperandInternal(Operand, Static);
 
-  if (isAddressImplicit)
+  if (isAddressImplicit) {
     Out << ')';
+  }
 }
 
 // Some instructions need to have their result value casted back to the
@@ -1392,26 +1439,26 @@ void CWriter::writeOperand(Value *Operand, bool Static) {
 bool CWriter::writeInstructionCast(const Instruction &I) {
   Type *Ty = I.getOperand(0)->getType();
   switch (I.getOpcode()) {
-  case Instruction::Add:
-  case Instruction::Sub:
-  case Instruction::Mul:
-    // We need to cast integer arithmetic so that it is always performed
-    // as unsigned, to avoid undefined behavior on overflow.
-  case Instruction::LShr:
-  case Instruction::URem:
-  case Instruction::UDiv:
-    Out << "((";
-    printSimpleType(Out, Ty, false);
-    Out << ")(";
-    return true;
-  case Instruction::AShr:
-  case Instruction::SRem:
-  case Instruction::SDiv:
-    Out << "((";
-    printSimpleType(Out, Ty, true);
-    Out << ")(";
-    return true;
-  default: break;
+    case Instruction::Add:
+    case Instruction::Sub:
+    case Instruction::Mul:
+      // We need to cast integer arithmetic so that it is always performed
+      // as unsigned, to avoid undefined behavior on overflow.
+    case Instruction::LShr:
+    case Instruction::URem:
+    case Instruction::UDiv:
+      Out << "((";
+      printSimpleType(Out, Ty, false);
+      Out << ")(";
+      return true;
+    case Instruction::AShr:
+    case Instruction::SRem:
+    case Instruction::SDiv:
+      Out << "((";
+      printSimpleType(Out, Ty, true);
+      Out << ")(";
+      return true;
+    default: break;
   }
   return false;
 }
@@ -1419,10 +1466,10 @@ bool CWriter::writeInstructionCast(const Instruction &I) {
 // Write the operand with a cast to another type based on the Opcode being used.
 // This will be used in cases where an instruction has specific type
 // requirements (usually signedness) for its operands.
-void CWriter::writeOperandWithCast(Value* Operand, unsigned Opcode) {
+void CWriter::writeOperandWithCast(Value *Operand, unsigned Opcode) {
 
   // Extract the operand's type, we'll need it.
-  Type* OpTy = Operand->getType();
+  Type *OpTy = Operand->getType();
 
   // Indicate whether to do the cast or not.
   bool shouldCast = false;
@@ -1465,13 +1512,14 @@ void CWriter::writeOperandWithCast(Value* Operand, unsigned Opcode) {
     Out << ")";
     writeOperand(Operand);
     Out << ")";
-  } else
+  } else {
     writeOperand(Operand);
+  }
 }
 
 // Write the operand with a cast to another type based on the icmp predicate
 // being used.
-void CWriter::writeOperandWithCast(Value* Operand, const ICmpInst &Cmp) {
+void CWriter::writeOperandWithCast(Value *Operand, const ICmpInst &Cmp) {
   // This has to do a cast to ensure the operand has the right signedness.
   // Also, if the operand is a pointer, we make sure to cast to an integer when
   // doing the comparison both for signedness and so that the C compiler doesn't
@@ -1490,9 +1538,10 @@ void CWriter::writeOperandWithCast(Value* Operand, const ICmpInst &Cmp) {
   bool castIsSigned = Cmp.isSigned();
 
   // If the operand was a pointer, convert to a large integer type.
-  Type* OpTy = Operand->getType();
-  if (OpTy->isPointerTy())
+  Type *OpTy = Operand->getType();
+  if (OpTy->isPointerTy()) {
     OpTy = TD->getIntPtrType(Operand->getContext());
+  }
 
   Out << "((";
   printSimpleType(Out, OpTy, castIsSigned);
@@ -1504,10 +1553,10 @@ void CWriter::writeOperandWithCast(Value* Operand, const ICmpInst &Cmp) {
 // generateCompilerSpecificCode - This is where we add conditional compilation
 // directives to cater to specific compilers as need be.
 //
-static void generateCompilerSpecificCode(formatted_raw_ostream& Out,
-                                         const DataLayout *TD) {
+static void generateCompilerSpecificCode(formatted_raw_ostream &Out,
+    const DataLayout *TD) {
   // Alloca is hard to get, and we don't want to include stdlib.h here.
-  #if 0
+#if 0
   Out << "/* get a declaration for alloca */\n"
       << "#if defined(__CYGWIN__) || defined(__MINGW32__)\n"
       << "#define  alloca(x) __builtin_alloca((x))\n"
@@ -1601,7 +1650,7 @@ static void generateCompilerSpecificCode(formatted_raw_ostream& Out,
       << "#define LLVM_INF           __builtin_inf()         /* Double */\n"
       << "#define LLVM_INFF          __builtin_inff()        /* Float */\n"
       << "#define LLVM_PREFETCH(addr,rw,locality) "
-                              "__builtin_prefetch(addr,rw,locality)\n"
+      "__builtin_prefetch(addr,rw,locality)\n"
       << "#define __ATTRIBUTE_CTOR__ __attribute__((constructor))\n"
       << "#define __ATTRIBUTE_DTOR__ __attribute__((destructor))\n"
       << "#define LLVM_ASM           __asm__\n"
@@ -1638,22 +1687,29 @@ static void generateCompilerSpecificCode(formatted_raw_ostream& Out,
 
 /// FindStaticTors - Given a static ctor/dtor list, unpack its contents into
 /// the StaticTors set.
-static void FindStaticTors(GlobalVariable *GV, std::set<Function*> &StaticTors){
+static void FindStaticTors(GlobalVariable *GV, std::set<Function *> &StaticTors) {
   ConstantArray *InitList = dyn_cast<ConstantArray>(GV->getInitializer());
-  if (!InitList) return;
+  if (!InitList) {
+    return;
+  }
 
   for (unsigned i = 0, e = InitList->getNumOperands(); i != e; ++i)
-    if (ConstantStruct *CS = dyn_cast<ConstantStruct>(InitList->getOperand(i))){
-      if (CS->getNumOperands() != 2) return;  // Not array of 2-element structs.
+    if (ConstantStruct *CS = dyn_cast<ConstantStruct>(InitList->getOperand(i))) {
+      if (CS->getNumOperands() != 2) {
+        return;  // Not array of 2-element structs.
+      }
 
-      if (CS->getOperand(1)->isNullValue())
+      if (CS->getOperand(1)->isNullValue()) {
         return;  // Found a null terminator, exit printing.
+      }
       Constant *FP = CS->getOperand(1);
       if (ConstantExpr *CE = dyn_cast<ConstantExpr>(FP))
-        if (CE->isCast())
+        if (CE->isCast()) {
           FP = CE->getOperand(0);
-      if (Function *F = dyn_cast<Function>(FP))
+        }
+      if (Function *F = dyn_cast<Function>(FP)) {
         StaticTors.insert(F);
+      }
     }
 }
 
@@ -1668,20 +1724,23 @@ enum SpecialGlobalClass {
 static SpecialGlobalClass getGlobalVariableClass(const GlobalVariable *GV) {
   // If this is a global ctors/dtors list, handle it now.
   if (GV->hasAppendingLinkage() && GV->use_empty()) {
-    if (GV->getName() == "llvm.global_ctors")
+    if (GV->getName() == "llvm.global_ctors") {
       return GlobalCtors;
-    else if (GV->getName() == "llvm.global_dtors")
+    } else if (GV->getName() == "llvm.global_dtors") {
       return GlobalDtors;
+    }
   }
 
   // Otherwise, if it is other metadata, don't print it.  This catches things
   // like debug information.
-  if (strcmp(GV->getSection(), "llvm.metadata") == 0)
+  if (strcmp(GV->getSection(), "llvm.metadata") == 0) {
     return NotPrinted;
+  }
 
   // __local variables are printed in the function that uses them
-  if (GV->getType()->getAddressSpace() == 3)
+  if (GV->getType()->getAddressSpace() == 3) {
     return NotPrinted;
+  }
 
   return NotSpecial;
 }
@@ -1692,16 +1751,17 @@ static void PrintEscapedString(const char *Str, unsigned Length,
                                raw_ostream &Out) {
   for (unsigned i = 0; i != Length; ++i) {
     unsigned char C = Str[i];
-    if (isprint(C) && C != '\\' && C != '"')
+    if (isprint(C) && C != '\\' && C != '"') {
       Out << C;
-    else if (C == '\\')
+    } else if (C == '\\') {
       Out << "\\\\";
-    else if (C == '\"')
+    } else if (C == '\"')
       Out << "\\\"";
-    else if (C == '\t')
+    else if (C == '\t') {
       Out << "\\t";
-    else
+    } else {
       Out << "\\x" << hexdigit(C >> 4) << hexdigit(C & 0x0F);
+    }
   }
 }
 
@@ -1711,37 +1771,37 @@ static void PrintEscapedString(const std::string &Str, raw_ostream &Out) {
   PrintEscapedString(Str.c_str(), Str.size(), Out);
 }
 
-void CWriter::printInitializer(GlobalVariable * I)
-{
-    if(!I) 
-      return;
-    
-    // If the initializer is not null, emit the initializer.  If it is null,
-    // we try to avoid emitting large amounts of zeros.  The problem with
-    // this, however, occurs when the variable has weak linkage.  In this
-    // case, the assembler will complain about the variable being both weak
-    // and common, so we disable this optimization.
-    // FIXME common linkage should avoid this problem.
-    if (I->hasInitializer() && !I->getInitializer()->isNullValue()) {
-      Out << " = " ;
+void CWriter::printInitializer(GlobalVariable *I) {
+  if (!I) {
+    return;
+  }
+
+  // If the initializer is not null, emit the initializer.  If it is null,
+  // we try to avoid emitting large amounts of zeros.  The problem with
+  // this, however, occurs when the variable has weak linkage.  In this
+  // case, the assembler will complain about the variable being both weak
+  // and common, so we disable this optimization.
+  // FIXME common linkage should avoid this problem.
+  if (I->hasInitializer() && !I->getInitializer()->isNullValue()) {
+    Out << " = " ;
+    writeOperand(I->getInitializer(), true);
+  } else if (I->hasWeakLinkage()) {
+    // We have to specify an initializer, but it doesn't have to be
+    // complete.  If the value is an aggregate, print out { 0 }, and let
+    // the compiler figure out the rest of the zeros.
+    Out << " = " ;
+    if (I->getInitializer()->getType()->isStructTy() ||
+        I->getInitializer()->getType()->isVectorTy()) {
+      Out << "{ 0 }";
+    } else if (I->getInitializer()->getType()->isArrayTy()) {
+      // As with structs and vectors, but with an extra set of braces
+      // because arrays are wrapped in structs.
+      Out << "{ { 0 } }";
+    } else {
+      // Just print it out normally.
       writeOperand(I->getInitializer(), true);
-    } else if (I->hasWeakLinkage()) {
-      // We have to specify an initializer, but it doesn't have to be
-      // complete.  If the value is an aggregate, print out { 0 }, and let
-      // the compiler figure out the rest of the zeros.
-      Out << " = " ;
-      if (I->getInitializer()->getType()->isStructTy() ||
-          I->getInitializer()->getType()->isVectorTy()) {
-        Out << "{ 0 }";
-      } else if (I->getInitializer()->getType()->isArrayTy()) {
-        // As with structs and vectors, but with an extra set of braces
-        // because arrays are wrapped in structs.
-        Out << "{ { 0 } }";
-      } else {
-        // Just print it out normally.
-        writeOperand(I->getInitializer(), true);
-      }
     }
+  }
 }
 
 bool CWriter::doInitialization(Module &M) {
@@ -1756,12 +1816,14 @@ bool CWriter::doInitialization(Module &M) {
 
 #if 0
   std::string Triple = TheModule->getTargetTriple();
-  if (Triple.empty())
+  if (Triple.empty()) {
     Triple = llvm::sys::getDefaultTargetTriple();
+  }
 
   std::string E;
-  if (const Target *Match = TargetRegistry::lookupTarget(Triple, E))
+  if (const Target *Match = TargetRegistry::lookupTarget(Triple, E)) {
     TAsm = Match->createMCAsmInfo(Triple);
+  }
 #endif
   TAsm = new CBEMCAsmInfo();
   MRI  = new MCRegisterInfo();
@@ -1770,17 +1832,17 @@ bool CWriter::doInitialization(Module &M) {
 
   // Keep track of which functions are static ctors/dtors so they can have
   // an attribute added to their prototypes.
-  std::set<Function*> StaticCtors, StaticDtors;
+  std::set<Function *> StaticCtors, StaticDtors;
   for (Module::global_iterator I = M.global_begin(), E = M.global_end();
        I != E; ++I) {
     switch (getGlobalVariableClass(I)) {
-    default: break;
-    case GlobalCtors:
-      FindStaticTors(I, StaticCtors);
-      break;
-    case GlobalDtors:
-      FindStaticTors(I, StaticDtors);
-      break;
+      default: break;
+      case GlobalCtors:
+        FindStaticTors(I, StaticCtors);
+        break;
+      case GlobalDtors:
+        FindStaticTors(I, StaticDtors);
+        break;
     }
   }
 
@@ -1814,14 +1876,14 @@ bool CWriter::doInitialization(Module &M) {
       // We found a newline, print the portion of the asm string from the
       // last newline up to this newline.
       Out << "\"";
-      PrintEscapedString(std::string(Asm.begin()+CurPos, Asm.begin()+NewLine),
+      PrintEscapedString(std::string(Asm.begin() + CurPos, Asm.begin() + NewLine),
                          Out);
       Out << "\\n\"\n";
-      CurPos = NewLine+1;
+      CurPos = NewLine + 1;
       NewLine = Asm.find_first_of('\n', CurPos);
     }
     Out << "\"";
-    PrintEscapedString(std::string(Asm.begin()+CurPos, Asm.end()), Out);
+    PrintEscapedString(std::string(Asm.begin() + CurPos, Asm.end()), Out);
     Out << "\");\n"
         << "/* End Module asm statements */\n";
   }
@@ -1839,22 +1901,25 @@ bool CWriter::doInitialization(Module &M) {
       if (I->hasExternalLinkage() || I->hasExternalWeakLinkage() ||
           I->hasCommonLinkage()) {
         Out << "extern ";
-        if(I->getInitializer()->getType()->isStructTy())
+        if (I->getInitializer()->getType()->isStructTy()) {
           Out << "struct ";
-      }
-      else if (I->hasDLLImportLinkage())
+        }
+      } else if (I->hasDLLImportLinkage()) {
         Out << "__declspec(dllimport) ";
-      else
-        continue; // Internal Global
+      } else {
+        continue;  // Internal Global
+      }
 
       // Thread Local Storage
-      if (I->isThreadLocal())
+      if (I->isThreadLocal()) {
         Out << "__thread ";
+      }
 
       printType(Out, I->getType()->getElementType(), false, GetValueName(I));
 
-      if (I->hasExternalWeakLinkage())
-         Out << " __EXTERNAL_WEAK__";
+      if (I->hasExternalWeakLinkage()) {
+        Out << " __EXTERNAL_WEAK__";
+      }
       Out << ";\n";
     }
   }
@@ -1868,7 +1933,7 @@ bool CWriter::doInitialization(Module &M) {
   Out << "long double fmodl(long double, long double);\n";
 #endif
   // Store the intrinsics which will be declared/defined below.
-  SmallVector<const Function*, 8> intrinsicsToDefine;
+  SmallVector<const Function *, 8> intrinsicsToDefine;
 
   for (Module::iterator I = M.begin(), E = M.end(); I != E; ++I) {
     // Don't print declarations for intrinsic functions.
@@ -1886,25 +1951,32 @@ bool CWriter::doInitialization(Module &M) {
     }
 
     if (I->getName() == "setjmp" ||
-        I->getName() == "longjmp" || I->getName() == "_setjmp")
+        I->getName() == "longjmp" || I->getName() == "_setjmp") {
       continue;
+    }
 
-    if (I->hasExternalWeakLinkage())
+    if (I->hasExternalWeakLinkage()) {
       Out << "extern ";
+    }
     //printFunctionSignature(I, true);
     //if (I->hasWeakLinkage() || I->hasLinkOnceLinkage())
     //  Out << " __ATTRIBUTE_WEAK__";
-    if (I->hasExternalWeakLinkage())
+    if (I->hasExternalWeakLinkage()) {
       Out << " __EXTERNAL_WEAK__";
-    if (StaticCtors.count(I))
+    }
+    if (StaticCtors.count(I)) {
       Out << " __ATTRIBUTE_CTOR__";
-    if (StaticDtors.count(I))
+    }
+    if (StaticDtors.count(I)) {
       Out << " __ATTRIBUTE_DTOR__";
-    if (I->hasHiddenVisibility())
+    }
+    if (I->hasHiddenVisibility()) {
       Out << " __HIDDEN__";
+    }
 
-    if (I->hasName() && I->getName()[0] == 1)
+    if (I->hasName() && I->getName()[0] == 1) {
       Out << " LLVM_ASM(\"" << I->getName().substr(1) << "\")";
+    }
 
     //Out << ";\n";
   }
@@ -1916,31 +1988,36 @@ bool CWriter::doInitialization(Module &M) {
          I != E; ++I)
       if (!I->isDeclaration()) {
         // Ignore special globals, such as debug info.
-        if (getGlobalVariableClass(I))
+        if (getGlobalVariableClass(I)) {
           continue;
+        }
 
-        if (I->hasLocalLinkage())
+        if (I->hasLocalLinkage()) {
           Out << "static struct ";
-        else
+        } else {
           Out << "extern ";
+        }
 
         // Thread Local Storage
-        if (I->isThreadLocal())
+        if (I->isThreadLocal()) {
           Out << "__thread ";
+        }
 
         printType(Out, I->getType()->getElementType(), false,
                   GetValueName(I));
 
-        if (I->hasLinkOnceLinkage())
+        if (I->hasLinkOnceLinkage()) {
           Out << " __attribute__((common))";
-        else if (I->hasCommonLinkage())     // FIXME is this right?
+        } else if (I->hasCommonLinkage()) { // FIXME is this right?
           Out << " __ATTRIBUTE_WEAK__";
-        else if (I->hasWeakLinkage())
+        } else if (I->hasWeakLinkage()) {
           Out << " __ATTRIBUTE_WEAK__";
-        else if (I->hasExternalWeakLinkage())
+        } else if (I->hasExternalWeakLinkage()) {
           Out << " __EXTERNAL_WEAK__";
-        if (I->hasHiddenVisibility())
+        }
+        if (I->hasHiddenVisibility()) {
           Out << " __HIDDEN__";
+        }
         Out << ";\n";
       }
   }
@@ -1952,11 +2029,13 @@ bool CWriter::doInitialization(Module &M) {
          I != E; ++I)
       if (!I->isDeclaration()) {
         // Ignore special globals, such as debug info.
-        if (getGlobalVariableClass(I))
+        if (getGlobalVariableClass(I)) {
           continue;
+        }
         // OpenCL allows only __constants in global scope
-        if (!I->isConstant())
-            continue;
+        if (!I->isConstant()) {
+          continue;
+        }
 
         Out << "__constant struct ";
         printType(Out, I->getType()->getElementType(), false,
@@ -1965,8 +2044,9 @@ bool CWriter::doInitialization(Module &M) {
         Out << ";\n";
       }
   }
-  if (!M.empty())
+  if (!M.empty()) {
     Out << "\n\n/* Function Bodies */\n";
+  }
 
   // Emit some helper functions for dealing with FCMP instruction's
   // predicates
@@ -2003,7 +2083,7 @@ bool CWriter::doInitialization(Module &M) {
   Out << "return X >= Y ; }\n";
 
   // Emit definitions of the intrinsics.
-  for (SmallVector<const Function*, 8>::const_iterator
+  for (SmallVector<const Function *, 8>::const_iterator
        I = intrinsicsToDefine.begin(),
        E = intrinsicsToDefine.end(); I != E; ++I) {
     printIntrinsicDefinition(**I, Out);
@@ -2021,8 +2101,9 @@ void CWriter::printFloatingPointConstants(Function &F) {
   // precision.
   //
   for (constant_iterator I = constant_begin(&F), E = constant_end(&F);
-       I != E; ++I)
+       I != E; ++I) {
     printFloatingPointConstants(*I);
+  }
 
   //Out << '\n';
 }
@@ -2030,8 +2111,9 @@ void CWriter::printFloatingPointConstants(Function &F) {
 void CWriter::printFloatingPointConstants(const Constant *C) {
   // If this is a constant expression, recursively check for constant fp values.
   if (const ConstantExpr *CE = dyn_cast<ConstantExpr>(C)) {
-    for (unsigned i = 0, e = CE->getNumOperands(); i != e; ++i)
+    for (unsigned i = 0, e = CE->getNumOperands(); i != e; ++i) {
       printFloatingPointConstants(CE->getOperand(i));
+    }
     return;
   }
 
@@ -2041,8 +2123,9 @@ void CWriter::printFloatingPointConstants(const Constant *C) {
       // Do not put in FPConstantMap if safe.
       isFPCSafeToPrint(FPC) ||
       // Already printed this constant?
-      FPConstantMap.count(FPC))
+      FPConstantMap.count(FPC)) {
     return;
+  }
 
   FPConstantMap[FPC] = FPCounter;  // Number the FP constants
 
@@ -2050,28 +2133,28 @@ void CWriter::printFloatingPointConstants(const Constant *C) {
     double Val = FPC->getValueAPF().convertToDouble();
     uint64_t i = FPC->getValueAPF().bitcastToAPInt().getZExtValue();
     Out << "#ifdef __OPENCL_VERSION__\n"
-    << "static __constant ConstantDoubleTy FPConstant" << FPCounter
-    << " = 0x" << utohexstr(i)
-    << "ULL;    /* " << Val << " */\n"
-    << "#else\n"
-    << "static const ConstantDoubleTy FPConstant" << FPCounter
-    << " = 0x" << utohexstr(i)
-    << "ULL;    /* " << Val << " */\n"
-    << "#endif";
+        << "static __constant ConstantDoubleTy FPConstant" << FPCounter
+        << " = 0x" << utohexstr(i)
+        << "ULL;    /* " << Val << " */\n"
+        << "#else\n"
+        << "static const ConstantDoubleTy FPConstant" << FPCounter
+        << " = 0x" << utohexstr(i)
+        << "ULL;    /* " << Val << " */\n"
+        << "#endif";
     FPCounter += 1;
   } else if (FPC->getType() == Type::getFloatTy(FPC->getContext())) {
     float Val = FPC->getValueAPF().convertToFloat();
     uint32_t i = (uint32_t)FPC->getValueAPF().bitcastToAPInt().
-    getZExtValue();
+                 getZExtValue();
     Out << "#ifdef __OPENCL_VERSION__\n"
-    << "static __constant ConstantFloatTy FPConstant" << FPCounter
-    << " = 0x" << utohexstr(i)
-    << "U;    /* " << Val << " */\n"
-    << "#else\n"
-    << "static const ConstantFloatTy FPConstant" << FPCounter
-    << " = 0x" << utohexstr(i)
-    << "U;    /* " << Val << " */\n"
-    << "#endif\n";
+        << "static __constant ConstantFloatTy FPConstant" << FPCounter
+        << " = 0x" << utohexstr(i)
+        << "U;    /* " << Val << " */\n"
+        << "#else\n"
+        << "static const ConstantFloatTy FPConstant" << FPCounter
+        << " = 0x" << utohexstr(i)
+        << "U;    /* " << Val << " */\n"
+        << "#endif\n";
     FPCounter += 1;
   } else {
     llvm_unreachable("Unknown float type!");
@@ -2095,33 +2178,36 @@ void CWriter::printModuleTypes() {
   // Get all of the struct types used in the module.
   run(*TheModule, false);
 
-  if (StructTypes.empty()) return;
+  if (StructTypes.empty()) {
+    return;
+  }
 
   Out << "/* Structure forward decls */\n";
 
   unsigned NextTypeID = 0;
-  
+
   // If any of them are missing names, add a unique ID to UnnamedStructIDs.
   // Print out forward declarations for structure types.
   for (unsigned i = 0, e = StructTypes.size(); i != e; ++i) {
     StructType *ST = StructTypes[i];
 
-    if (ST->isLiteral() || ST->getName().empty())
+    if (ST->isLiteral() || ST->getName().empty()) {
       UnnamedStructIDs[ST] = NextTypeID++;
+    }
 
     std::string Name = getStructName(ST);
     Out << "struct " << Name << ";\n";
   }
 
-   Out << '\n';
+  Out << '\n';
 
-   // Now we can print out typedefs.  Above, we guaranteed that this can only be
-   // for struct or opaque types.
-   Out << "/* Typedefs */\n";
-   for (unsigned i = 0, e = StructTypes.size(); i != e; ++i) {
-      StructType *ST = StructTypes[i];
-       std::string Name = getStructName(ST);
-      Out << "typedef struct " << Name << ' ' << Name << ";\n";
+  // Now we can print out typedefs.  Above, we guaranteed that this can only be
+  // for struct or opaque types.
+  Out << "/* Typedefs */\n";
+  for (unsigned i = 0, e = StructTypes.size(); i != e; ++i) {
+    StructType *ST = StructTypes[i];
+    std::string Name = getStructName(ST);
+    Out << "typedef struct " << Name << ' ' << Name << ";\n";
   }
 
   Out << '\n';
@@ -2136,7 +2222,9 @@ void CWriter::printModuleTypes() {
   for (unsigned i = 0, e = StructTypes.size(); i != e; ++i)
     if (StructTypes[i]->isStructTy())
       // Only print out used types!
+    {
       printContainedStructs(StructTypes[i], StructPrinted);
+    }
 }
 
 // Push the struct onto the stack and recursively push all structs
@@ -2145,56 +2233,65 @@ void CWriter::printModuleTypes() {
 // TODO:  Make this work properly with vector types
 //
 void CWriter::printContainedStructs(Type *Ty,
-                                SmallPtrSet<Type *, 16> &StructPrinted) {
+                                    SmallPtrSet<Type *, 16> &StructPrinted) {
   // Don't walk through pointers.
-  if (Ty->isPointerTy() || (Ty->getTypeID() >= 0 && Ty->getTypeID() <= 9) || Ty->isIntegerTy())
+  if (Ty->isPointerTy() || (Ty->getTypeID() >= 0 && Ty->getTypeID() <= 9) || Ty->isIntegerTy()) {
     return;
+  }
 
   // Walk through arrays, declaring their container structs.
   if (Ty->isArrayTy()) {
     ArrayType *ATy = cast<ArrayType>(Ty);
-    std::vector<Type*> structMembers;
+    std::vector<Type *> structMembers;
     structMembers.push_back(ATy);
-    StructType* ST = StructType::get(TheModule->getContext(), structMembers);
+    StructType *ST = StructType::get(TheModule->getContext(), structMembers);
 
     // Check to see if we have already printed this struct.
-    if (!StructPrinted.insert(ST)) return;
+    if (!StructPrinted.insert(ST)) {
+      return;
+    }
 
     // Print all contained types first.
     for (Type::subtype_iterator I = Ty->subtype_begin(),
-         E = Ty->subtype_end(); I != E; ++I)
+         E = Ty->subtype_end(); I != E; ++I) {
       printContainedStructs(*I, StructPrinted);
-    
+    }
+
     // Print structure type out.
     printType(Out, ST, false, getStructName(ST), true);
     Out << ";\n\n";
   }
   // Print all contained types first.
   for (Type::subtype_iterator I = Ty->subtype_begin(),
-       E = Ty->subtype_end(); I != E; ++I)
+       E = Ty->subtype_end(); I != E; ++I) {
     printContainedStructs(*I, StructPrinted);
+  }
 
   if (StructType *ST = dyn_cast<StructType>(Ty)) {
     // Check to see if we have already printed this struct.
-    if (!StructPrinted.insert(Ty)) return;
-   
+    if (!StructPrinted.insert(Ty)) {
+      return;
+    }
+
     // Print structure type out.
     printType(Out, ST, false, getStructName(ST), true);
     Out << ";\n\n";
   }
 }
-bool CWriter::isKernelFunction(const Function *F)
-{
-  if(!F)
+bool CWriter::isKernelFunction(const Function *F) {
+  if (!F) {
     return false;
+  }
   llvm::NamedMDNode *openCLMetadata = TheModule->getNamedMetadata("opencl.kernels");
-  if(!openCLMetadata)
+  if (!openCLMetadata) {
     return false;
+  }
 
-  for(unsigned K = 0, E = openCLMetadata->getNumOperands(); K != E; ++K) {
+  for (unsigned K = 0, E = openCLMetadata->getNumOperands(); K != E; ++K) {
     llvm::MDNode &kernelMD = *openCLMetadata->getOperand(K);
-    if(kernelMD.getOperand(0) == F)
+    if (kernelMD.getOperand(0) == F) {
       return true;
+    }
   }
   return false;
 }
@@ -2203,23 +2300,24 @@ void CWriter::printFunctionSignature(const Function *F, bool Prototype) {
   /// isStructReturn - Should this function actually return a struct by-value?
   bool isStructReturn = F->hasStructRetAttr();
 
-  if (F->hasLocalLinkage() && !isKernelFunction(F))
+  if (F->hasLocalLinkage() && !isKernelFunction(F)) {
     Out << "static ";
+  }
   // No dllimport and dllexport linkage in SPIR 1.2
   //if (F->hasDLLImportLinkage()) Out << "__declspec(dllimport) ";
   //if (F->hasDLLExportLinkage()) Out << "__declspec(dllexport) ";
   switch (F->getCallingConv()) {
-   case CallingConv::X86_StdCall:
-    Out << "__attribute__((stdcall)) ";
-    break;
-   case CallingConv::X86_FastCall:
-    Out << "__attribute__((fastcall)) ";
-    break;
-   case CallingConv::X86_ThisCall:
-    Out << "__attribute__((thiscall)) ";
-    break;
-   default:
-    break;
+    case CallingConv::X86_StdCall:
+      Out << "__attribute__((stdcall)) ";
+      break;
+    case CallingConv::X86_FastCall:
+      Out << "__attribute__((fastcall)) ";
+      break;
+    case CallingConv::X86_ThisCall:
+      Out << "__attribute__((thiscall)) ";
+      break;
+    default:
+      break;
   }
 
   // Loop over the arguments, printing them...
@@ -2231,10 +2329,11 @@ void CWriter::printFunctionSignature(const Function *F, bool Prototype) {
 
   // Print out the name...
   FunctionInnards << GetValueName(F) << '(';
-  
+
   // Print the keyword of kernel
-  if(isKernelFunction(F))
+  if (isKernelFunction(F)) {
     Out << "__kernel ";
+  }
   bool PrintedArg = false;
   if (!F->isDeclaration()) {
     if (!F->arg_empty()) {
@@ -2251,19 +2350,22 @@ void CWriter::printFunctionSignature(const Function *F, bool Prototype) {
 
       std::string ArgName;
       for (; I != E; ++I) {
-        if (PrintedArg) FunctionInnards << ", ";
-        if (I->hasName() || !Prototype)
+        if (PrintedArg) {
+          FunctionInnards << ", ";
+        }
+        if (I->hasName() || !Prototype) {
           ArgName = GetValueName(I);
-        else
+        } else {
           ArgName = "";
+        }
         Type *ArgTy = I->getType();
         if (PAL.hasAttribute(Idx, Attribute::ByVal)) {
           ArgTy = cast<PointerType>(ArgTy)->getElementType();
           ByValParams.insert(I);
         }
         printType(FunctionInnards, ArgTy,
-            /*isSigned=*/PAL.hasAttribute(Idx, Attribute::SExt),
-            ArgName);
+                  /*isSigned=*/PAL.hasAttribute(Idx, Attribute::SExt),
+                  ArgName);
         PrintedArg = true;
         ++Idx;
       }
@@ -2282,14 +2384,16 @@ void CWriter::printFunctionSignature(const Function *F, bool Prototype) {
     }
 
     for (; I != E; ++I) {
-      if (PrintedArg) FunctionInnards << ", ";
+      if (PrintedArg) {
+        FunctionInnards << ", ";
+      }
       Type *ArgTy = *I;
       if (PAL.hasAttribute(Idx, Attribute::ByVal)) {
         assert(ArgTy->isPointerTy());
         ArgTy = cast<PointerType>(ArgTy)->getElementType();
       }
       printType(FunctionInnards, ArgTy,
-             /*isSigned=*/PAL.hasAttribute(Idx, Attribute::SExt));
+                /*isSigned=*/PAL.hasAttribute(Idx, Attribute::SExt));
       PrintedArg = true;
       ++Idx;
     }
@@ -2312,9 +2416,9 @@ void CWriter::printFunctionSignature(const Function *F, bool Prototype) {
 
   // Get the return tpe for the function.
   Type *RetTy;
-  if (!isStructReturn)
+  if (!isStructReturn) {
     RetTy = F->getReturnType();
-  else {
+  } else {
     // If this is a struct-return function, print the struct-return type.
     RetTy = cast<PointerType>(FT->getParamType(0))->getElementType();
   }
@@ -2326,8 +2430,9 @@ void CWriter::printFunctionSignature(const Function *F, bool Prototype) {
 }
 
 static inline bool isFPIntBitCast(const Instruction &I) {
-  if (!isa<BitCastInst>(I))
+  if (!isa<BitCastInst>(I)) {
     return false;
+  }
   Type *SrcTy = I.getOperand(0)->getType();
   Type *DstTy = I.getType();
   return (SrcTy->isFloatingPointTy() && DstTy->isIntegerTy()) ||
@@ -2335,8 +2440,9 @@ static inline bool isFPIntBitCast(const Instruction &I) {
 }
 
 static void FindLocalName(Instruction *I, Value *&LocalValue, Type *&LocalTy) {
-  if (!I)
+  if (!I) {
     return;
+  }
   if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(I)) {
     if (GEP->getPointerAddressSpace() == 3) { // OpenCL __local?
       if (isa<GlobalValue>(GEP->getPointerOperand())) {
@@ -2347,13 +2453,12 @@ static void FindLocalName(Instruction *I, Value *&LocalValue, Type *&LocalTy) {
     }
   } else if (LoadInst *LI = dyn_cast<LoadInst>(I)) {
     if (LI->getPointerAddressSpace() == 3) {
-      Value * PO = LI->getPointerOperand();
+      Value *PO = LI->getPointerOperand();
       if (const ConstantExpr *CE = dyn_cast<ConstantExpr>(PO)) {
         switch (CE->getOpcode()) {
-          case Instruction::GetElementPtr:
-            {
+          case Instruction::GetElementPtr: {
               PointerType  *PTy = cast<PointerType>(
-                  CE->getOperand(0)->getType());
+                                    CE->getOperand(0)->getType());
               LocalTy = PTy->getElementType();
               LocalValue = CE->getOperand(0);
             }
@@ -2364,7 +2469,7 @@ static void FindLocalName(Instruction *I, Value *&LocalValue, Type *&LocalTy) {
       } else if (isa<GetElementPtrInst>(PO)) {
         FindLocalName(dyn_cast<Instruction>(PO), LocalValue, LocalTy);
       } else if (isa<PHINode>(PO)) {
-         // The sources must have been processed. Do nothing.
+        // The sources must have been processed. Do nothing.
       } else if (dyn_cast<LoadInst>(PO)) {
         // Sample:
         //  %21 = load i64 addrspace(3)* %20, align 4
@@ -2373,7 +2478,7 @@ static void FindLocalName(Instruction *I, Value *&LocalValue, Type *&LocalTy) {
       } else if (dyn_cast<StoreInst>(PO)) {
         FindLocalName(dyn_cast<Instruction>(PO), LocalValue, LocalTy);
       } else {
-        if (PointerType* PTy = cast<PointerType>(PO->getType())) {
+        if (PointerType *PTy = cast<PointerType>(PO->getType())) {
           LocalTy = PTy->getElementType();
           LocalValue = PO;
         } else {
@@ -2383,17 +2488,15 @@ static void FindLocalName(Instruction *I, Value *&LocalValue, Type *&LocalTy) {
         }
       }
     }
-  }
-  else if (StoreInst *SI = dyn_cast<StoreInst>(I)) {
-    if (SI->getPointerAddressSpace() == 3) { 
+  } else if (StoreInst *SI = dyn_cast<StoreInst>(I)) {
+    if (SI->getPointerAddressSpace() == 3) {
       if (isa<GlobalValue>(SI->getPointerOperand())) {
-        Value * PO = SI->getPointerOperand();
+        Value *PO = SI->getPointerOperand();
         if (const ConstantExpr *CE = dyn_cast<ConstantExpr>(PO)) {
           switch (CE->getOpcode()) {
-            case Instruction::GetElementPtr:
-              {
+            case Instruction::GetElementPtr: {
                 PointerType  *PTy = cast<PointerType>(
-                    CE->getOperand(0)->getType());
+                                      CE->getOperand(0)->getType());
                 LocalTy = PTy->getElementType();
                 LocalValue = CE->getOperand(0);
               }
@@ -2411,7 +2514,7 @@ static void FindLocalName(Instruction *I, Value *&LocalValue, Type *&LocalTy) {
           FindLocalName(dyn_cast<Instruction>(PO), LocalValue, LocalTy);
         } else {
           PointerType  *PTy = cast<PointerType>(PO->getType());
-          if(PTy) {
+          if (PTy) {
             LocalTy = PTy->getElementType();
             LocalValue = PO;
           } else {
@@ -2427,58 +2530,64 @@ static void FindLocalName(Instruction *I, Value *&LocalValue, Type *&LocalTy) {
 
 static bool usedInOneFunc(const User *U, Function const *&oneFunc) {
   if (const GlobalVariable *othergv = dyn_cast<GlobalVariable>(U)) {
-    if (othergv->getName().str() == "llvm.used")
+    if (othergv->getName().str() == "llvm.used") {
       return true;
+    }
   }
 
   if (const Instruction *instr = dyn_cast<Instruction>(U)) {
     if (instr->getParent() && instr->getParent()->getParent()) {
       const Function *curFunc = instr->getParent()->getParent();
-      if (oneFunc && (curFunc != oneFunc))
+      if (oneFunc && (curFunc != oneFunc)) {
         return false;
+      }
       oneFunc = curFunc;
       return true;
-    } else
+    } else {
       return false;
+    }
   }
 
   if (const MDNode *md = dyn_cast<MDNode>(U))
     if (md->hasName() && ((md->getName().str() == "llvm.dbg.gv") ||
-                          (md->getName().str() == "llvm.dbg.sp")))
+                          (md->getName().str() == "llvm.dbg.sp"))) {
       return true;
+    }
 
 #if LLVM_VERSION_MAJOR == 3
-  #if LLVM_VERSION_MINOR == 3
+#if LLVM_VERSION_MINOR == 3
   for (User::const_use_iterator ui = U->use_begin(), ue = U->use_end();
        ui != ue; ++ui) {
-    if (usedInOneFunc(*ui, oneFunc) == false)
+    if (usedInOneFunc(*ui, oneFunc) == false) {
       return false;
+    }
   }
-  #elif LLVM_VERSION_MINOR == 5
-  for (const User *u : U->users()) {
-    if (usedInOneFunc(u, oneFunc) == false)
+#elif LLVM_VERSION_MINOR == 5
+  for (const User * u : U->users()) {
+    if (usedInOneFunc(u, oneFunc) == false) {
       return false;
+    }
   }
-  #else
-    #error Unsupported LLVM MINOR VERSION
-  #endif
 #else
-  #error Unsupported LLVM MAJOR VERSION
+#error Unsupported LLVM MINOR VERSION
+#endif
+#else
+#error Unsupported LLVM MAJOR VERSION
 #endif
 
   return true;
 }
 
-// Variables inside a __kernel function not declared with an address space qualifier, 
-// all variables inside non-kernel functions, and all function arguments are in 
+// Variables inside a __kernel function not declared with an address space qualifier,
+// all variables inside non-kernel functions, and all function arguments are in
 // the __private or private address space
- void  CWriter::printFunctionPrivateVaraibles(Function& F)
-{
+void  CWriter::printFunctionPrivateVaraibles(Function &F) {
   // We only care Kernel Function
-  if(!isKernelFunction(&F))
+  if (!isKernelFunction(&F)) {
     return;
+  }
 
-  Module* M = F.getParent();
+  Module *M = F.getParent();
   if (M && !M->global_empty()) {
     // Find out if a static global variable can be demoted to Function's scope.
     // The conditions to check are,
@@ -2492,11 +2601,13 @@ static bool usedInOneFunc(const User *U, Function const *&oneFunc) {
           I->hasName()) {
         const Function *oneFunc = 0;
         bool flag = usedInOneFunc(I, oneFunc);
-        if (flag == false || (flag&&!oneFunc))
-            continue;
+        if (flag == false || (flag && !oneFunc)) {
+          continue;
+        }
         // Not in this Funciton's scope
-        if (F.getName().str()!= oneFunc->getName().str())
-            continue;
+        if (F.getName().str() != oneFunc->getName().str()) {
+          continue;
+        }
         // Theoretically, an eligible parallel body, e.g OpenCL Kernel, does not have static global
         // non-constant variables inside. Even it has, we won't update them for the reason
         // that the occurrence of race condition can cause undefined behavior.
@@ -2507,7 +2618,7 @@ static bool usedInOneFunc(const User *U, Function const *&oneFunc) {
         // (1) Declare those variables in private or local address space inside its containing Kernel.
         //      This is to make Kernel compilation successful. Note that for performance-sensitive
         //      cases, local space is suggested.
-          // (2) Keep in mind that Kerne's behavior is still undefined if we try to utilize any 
+        // (2) Keep in mind that Kerne's behavior is still undefined if we try to utilize any
         //      values from those variables outside Kernel.
         Out << " /* FIXME: Static global variables inside. Make private instead */\n";
         Out << " __private ";
@@ -2539,9 +2650,9 @@ void CWriter::printFunction(Function &F) {
               GetValueName(F.arg_begin()));
     Out << " = &StructReturn;\n";
   }
-  
+
   printFunctionPrivateVaraibles(F);
-  
+
   bool PrintedVar = false;
 
   // print local variable information for the function
@@ -2561,7 +2672,7 @@ void CWriter::printFunction(Function &F) {
       if (isa<PHINode>(*I)) {  // Print out PHI node temporaries as well...
         Out << "  ";
         printType(Out, I->getType(), false,
-                  GetValueName(&*I)+"__PHI_TEMPORARY");
+                  GetValueName(&*I) + "__PHI_TEMPORARY");
         Out << ";\n";
       }
       PrintedVar = true;
@@ -2572,10 +2683,11 @@ void CWriter::printFunction(Function &F) {
       FindLocalName(&*I, LocalValue, LocalTy);
       if (LocalTy) {
         std::string LocalName = GetValueName(LocalValue);
-        if (PrintedLocal.find(LocalName) != PrintedLocal.end())
+        if (PrintedLocal.find(LocalName) != PrintedLocal.end()) {
           continue;
-        else
+        } else {
           PrintedLocal.insert(LocalName);
+        }
         Out << "  __local ";
         printType(Out, LocalTy, false, LocalName);
         Out << ";\n";
@@ -2592,17 +2704,20 @@ void CWriter::printFunction(Function &F) {
     }
   }
 
-  if (PrintedVar)
+  if (PrintedVar) {
     Out << '\n';
+  }
 
-  if (F.hasExternalLinkage() && F.getName() == "main")
+  if (F.hasExternalLinkage() && F.getName() == "main") {
     Out << "  CODE_FOR_MAIN();\n";
+  }
 
   // print the basic blocks
   for (Function::iterator BB = F.begin(), E = F.end(); BB != E; ++BB) {
     if (Loop *L = LI->getLoopFor(BB)) {
-      if (L->getHeader() == BB && L->getParentLoop() == 0)
+      if (L->getHeader() == BB && L->getParentLoop() == 0) {
         printLoop(L);
+      }
     } else {
       printBasicBlock(BB);
     }
@@ -2617,10 +2732,11 @@ void CWriter::printLoop(Loop *L) {
   for (unsigned i = 0, e = L->getBlocks().size(); i != e; ++i) {
     BasicBlock *BB = L->getBlocks()[i];
     Loop *BBLoop = LI->getLoopFor(BB);
-    if (BBLoop == L)
+    if (BBLoop == L) {
       printBasicBlock(BB);
-    else if (BB == BBLoop->getHeader() && BBLoop->getParentLoop() == L)
+    } else if (BB == BBLoop->getHeader() && BBLoop->getParentLoop() == L) {
       printLoop(BBLoop);
+    }
   }
   Out << "  } while (1); /* end of syntactic loop '"
       << L->getHeader()->getName() << "' */\n";
@@ -2640,17 +2756,20 @@ void CWriter::printBasicBlock(BasicBlock *BB) {
       break;
     }
 
-  if (NeedsLabel) Out << GetValueName(BB) << ":\n";
+  if (NeedsLabel) {
+    Out << GetValueName(BB) << ":\n";
+  }
 
   // Output all of the instructions in the basic block...
   for (BasicBlock::iterator II = BB->begin(), E = --BB->end(); II != E;
        ++II) {
     if (!isInlinableInst(*II) && !isDirectAlloca(II)) {
       if (II->getType() != Type::getVoidTy(BB->getContext()) &&
-          !isInlineAsm(*II))
+          !isInlineAsm(*II)) {
         outputLValue(II);
-      else
+      } else {
         Out << "  ";
+      }
       writeInstComputationInline(*II);
       Out << ";\n";
     }
@@ -2690,27 +2809,28 @@ void CWriter::visitReturnInst(ReturnInst &I) {
 
 void CWriter::visitSwitchInst(SwitchInst &SI) {
 
-  Value* Cond = SI.getCondition();
+  Value *Cond = SI.getCondition();
 
   Out << "  switch (";
   writeOperand(Cond);
   Out << ") {\n  default:\n";
-  printPHICopiesForSuccessor (SI.getParent(), SI.getDefaultDest(), 2);
+  printPHICopiesForSuccessor(SI.getParent(), SI.getDefaultDest(), 2);
   printBranchToBlock(SI.getParent(), SI.getDefaultDest(), 2);
   Out << ";\n";
 
   // Skip the first item since that's the default case.
   for (SwitchInst::CaseIt i = SI.case_begin(), e = SI.case_end(); i != e; ++i) {
-    ConstantInt* CaseVal = i.getCaseValue();
-    BasicBlock* Succ = i.getCaseSuccessor();
+    ConstantInt *CaseVal = i.getCaseValue();
+    BasicBlock *Succ = i.getCaseSuccessor();
     Out << "  case ";
     writeOperand(CaseVal);
     Out << ":\n";
-    printPHICopiesForSuccessor (SI.getParent(), Succ, 2);
+    printPHICopiesForSuccessor(SI.getParent(), Succ, 2);
     printBranchToBlock(SI.getParent(), Succ, 2);
     if (Function::iterator(Succ) ==
-        std::next(Function::iterator(SI.getParent())))
+        std::next(Function::iterator(SI.getParent()))) {
       Out << "    break;\n";
+    }
   }
 
   Out << "  }\n";
@@ -2730,19 +2850,21 @@ bool CWriter::isGotoCodeNecessary(BasicBlock *From, BasicBlock *To) {
   /// FIXME: This should be reenabled, but loop reordering safe!!
   return true;
 
-  if (std::next(Function::iterator(From)) != Function::iterator(To))
+  if (std::next(Function::iterator(From)) != Function::iterator(To)) {
     return true;  // Not the direct successor, we need a goto.
+  }
 
   //isa<SwitchInst>(From->getTerminator())
 
-  if (LI->getLoopFor(From) != LI->getLoopFor(To))
+  if (LI->getLoopFor(From) != LI->getLoopFor(To)) {
     return true;
+  }
   return false;
 }
 
-void CWriter::printPHICopiesForSuccessor (BasicBlock *CurBlock,
-                                          BasicBlock *Successor,
-                                          unsigned Indent) {
+void CWriter::printPHICopiesForSuccessor(BasicBlock *CurBlock,
+    BasicBlock *Successor,
+    unsigned Indent) {
   for (BasicBlock::iterator I = Successor->begin(); isa<PHINode>(I); ++I) {
     PHINode *PN = cast<PHINode>(I);
     // Now we have to do the printing.
@@ -2776,12 +2898,12 @@ void CWriter::visitBranchInst(BranchInst &I) {
       writeOperand(I.getCondition());
       Out << ") {\n";
 
-      printPHICopiesForSuccessor (I.getParent(), I.getSuccessor(0), 2);
+      printPHICopiesForSuccessor(I.getParent(), I.getSuccessor(0), 2);
       printBranchToBlock(I.getParent(), I.getSuccessor(0), 2);
 
       if (isGotoCodeNecessary(I.getParent(), I.getSuccessor(1))) {
         Out << "  } else {\n";
-        printPHICopiesForSuccessor (I.getParent(), I.getSuccessor(1), 2);
+        printPHICopiesForSuccessor(I.getParent(), I.getSuccessor(1), 2);
         printBranchToBlock(I.getParent(), I.getSuccessor(1), 2);
       }
     } else {
@@ -2790,13 +2912,13 @@ void CWriter::visitBranchInst(BranchInst &I) {
       writeOperand(I.getCondition());
       Out << ") {\n";
 
-      printPHICopiesForSuccessor (I.getParent(), I.getSuccessor(1), 2);
+      printPHICopiesForSuccessor(I.getParent(), I.getSuccessor(1), 2);
       printBranchToBlock(I.getParent(), I.getSuccessor(1), 2);
     }
 
     Out << "  }\n";
   } else {
-    printPHICopiesForSuccessor (I.getParent(), I.getSuccessor(0), 0);
+    printPHICopiesForSuccessor(I.getParent(), I.getSuccessor(0), 0);
     printBranchToBlock(I.getParent(), I.getSuccessor(0), 0);
   }
   Out << "\n";
@@ -2838,12 +2960,13 @@ void CWriter::visitBinaryOperator(Instruction &I) {
     Out << ")";
   } else if (I.getOpcode() == Instruction::FRem) {
     // Output a call to fmod/fmodf instead of emitting a%b
-    if (I.getType() == Type::getFloatTy(I.getContext()))
+    if (I.getType() == Type::getFloatTy(I.getContext())) {
       Out << "fmodf(";
-    else if (I.getType() == Type::getDoubleTy(I.getContext()))
+    } else if (I.getType() == Type::getDoubleTy(I.getContext())) {
       Out << "fmod(";
-    else  // all 3 flavors of long double
+    } else { // all 3 flavors of long double
       Out << "fmodl(";
+    }
     writeOperand(I.getOperand(0));
     Out << ", ";
     writeOperand(I.getOperand(1));
@@ -2860,34 +2983,35 @@ void CWriter::visitBinaryOperator(Instruction &I) {
     writeOperandWithCast(I.getOperand(0), I.getOpcode());
 
     switch (I.getOpcode()) {
-    case Instruction::Add:
-    case Instruction::FAdd: Out << " + "; break;
-    case Instruction::Sub:
-    case Instruction::FSub: Out << " - "; break;
-    case Instruction::Mul:
-    case Instruction::FMul: Out << " * "; break;
-    case Instruction::URem:
-    case Instruction::SRem:
-    case Instruction::FRem: Out << " % "; break;
-    case Instruction::UDiv:
-    case Instruction::SDiv:
-    case Instruction::FDiv: Out << " / "; break;
-    case Instruction::And:  Out << " & "; break;
-    case Instruction::Or:   Out << " | "; break;
-    case Instruction::Xor:  Out << " ^ "; break;
-    case Instruction::Shl : Out << " << "; break;
-    case Instruction::LShr:
-    case Instruction::AShr: Out << " >> "; break;
-    default:
+      case Instruction::Add:
+      case Instruction::FAdd: Out << " + "; break;
+      case Instruction::Sub:
+      case Instruction::FSub: Out << " - "; break;
+      case Instruction::Mul:
+      case Instruction::FMul: Out << " * "; break;
+      case Instruction::URem:
+      case Instruction::SRem:
+      case Instruction::FRem: Out << " % "; break;
+      case Instruction::UDiv:
+      case Instruction::SDiv:
+      case Instruction::FDiv: Out << " / "; break;
+      case Instruction::And:  Out << " & "; break;
+      case Instruction::Or:   Out << " | "; break;
+      case Instruction::Xor:  Out << " ^ "; break;
+      case Instruction::Shl : Out << " << "; break;
+      case Instruction::LShr:
+      case Instruction::AShr: Out << " >> "; break;
+      default:
 #ifndef NDEBUG
-       errs() << "Invalid operator type!" << I;
+        errs() << "Invalid operator type!" << I;
 #endif
-       llvm_unreachable(0);
+        llvm_unreachable(0);
     }
 
     writeOperandWithCast(I.getOperand(1), I.getOpcode());
-    if (NeedsClosingParens)
+    if (NeedsClosingParens) {
       Out << "))";
+    }
   }
 
   if (needsCast) {
@@ -2909,26 +3033,27 @@ void CWriter::visitICmpInst(ICmpInst &I) {
   writeOperandWithCast(I.getOperand(0), I);
 
   switch (I.getPredicate()) {
-  case ICmpInst::ICMP_EQ:  Out << " == "; break;
-  case ICmpInst::ICMP_NE:  Out << " != "; break;
-  case ICmpInst::ICMP_ULE:
-  case ICmpInst::ICMP_SLE: Out << " <= "; break;
-  case ICmpInst::ICMP_UGE:
-  case ICmpInst::ICMP_SGE: Out << " >= "; break;
-  case ICmpInst::ICMP_ULT:
-  case ICmpInst::ICMP_SLT: Out << " < "; break;
-  case ICmpInst::ICMP_UGT:
-  case ICmpInst::ICMP_SGT: Out << " > "; break;
-  default:
+    case ICmpInst::ICMP_EQ:  Out << " == "; break;
+    case ICmpInst::ICMP_NE:  Out << " != "; break;
+    case ICmpInst::ICMP_ULE:
+    case ICmpInst::ICMP_SLE: Out << " <= "; break;
+    case ICmpInst::ICMP_UGE:
+    case ICmpInst::ICMP_SGE: Out << " >= "; break;
+    case ICmpInst::ICMP_ULT:
+    case ICmpInst::ICMP_SLT: Out << " < "; break;
+    case ICmpInst::ICMP_UGT:
+    case ICmpInst::ICMP_SGT: Out << " > "; break;
+    default:
 #ifndef NDEBUG
-    errs() << "Invalid icmp predicate!" << I;
+      errs() << "Invalid icmp predicate!" << I;
 #endif
-    llvm_unreachable(0);
+      llvm_unreachable(0);
   }
 
   writeOperandWithCast(I.getOperand(1), I);
-  if (NeedsClosingParens)
+  if (NeedsClosingParens) {
     Out << "))";
+  }
 
   if (needsCast) {
     Out << "))";
@@ -2945,23 +3070,23 @@ void CWriter::visitFCmpInst(FCmpInst &I) {
     return;
   }
 
-  const char* op = 0;
+  const char *op = 0;
   switch (I.getPredicate()) {
-  default: llvm_unreachable("Illegal FCmp predicate");
-  case FCmpInst::FCMP_ORD: op = "ord"; break;
-  case FCmpInst::FCMP_UNO: op = "uno"; break;
-  case FCmpInst::FCMP_UEQ: op = "ueq"; break;
-  case FCmpInst::FCMP_UNE: op = "une"; break;
-  case FCmpInst::FCMP_ULT: op = "ult"; break;
-  case FCmpInst::FCMP_ULE: op = "ule"; break;
-  case FCmpInst::FCMP_UGT: op = "ugt"; break;
-  case FCmpInst::FCMP_UGE: op = "uge"; break;
-  case FCmpInst::FCMP_OEQ: op = "oeq"; break;
-  case FCmpInst::FCMP_ONE: op = "one"; break;
-  case FCmpInst::FCMP_OLT: op = "olt"; break;
-  case FCmpInst::FCMP_OLE: op = "ole"; break;
-  case FCmpInst::FCMP_OGT: op = "ogt"; break;
-  case FCmpInst::FCMP_OGE: op = "oge"; break;
+    default: llvm_unreachable("Illegal FCmp predicate");
+    case FCmpInst::FCMP_ORD: op = "ord"; break;
+    case FCmpInst::FCMP_UNO: op = "uno"; break;
+    case FCmpInst::FCMP_UEQ: op = "ueq"; break;
+    case FCmpInst::FCMP_UNE: op = "une"; break;
+    case FCmpInst::FCMP_ULT: op = "ult"; break;
+    case FCmpInst::FCMP_ULE: op = "ule"; break;
+    case FCmpInst::FCMP_UGT: op = "ugt"; break;
+    case FCmpInst::FCMP_UGE: op = "uge"; break;
+    case FCmpInst::FCMP_OEQ: op = "oeq"; break;
+    case FCmpInst::FCMP_ONE: op = "one"; break;
+    case FCmpInst::FCMP_OLT: op = "olt"; break;
+    case FCmpInst::FCMP_OLE: op = "ole"; break;
+    case FCmpInst::FCMP_OGT: op = "ogt"; break;
+    case FCmpInst::FCMP_OGE: op = "oge"; break;
   }
 
   Out << "llvm_fcmp_" << op << "(";
@@ -2973,18 +3098,19 @@ void CWriter::visitFCmpInst(FCmpInst &I) {
   Out << ")";
 }
 
-static const char * getFloatBitCastField(Type *Ty) {
+static const char *getFloatBitCastField(Type *Ty) {
   switch (Ty->getTypeID()) {
     default: llvm_unreachable("Invalid Type");
     case Type::FloatTyID:  return "Float";
     case Type::DoubleTyID: return "Double";
     case Type::IntegerTyID: {
-      unsigned NumBits = cast<IntegerType>(Ty)->getBitWidth();
-      if (NumBits <= 32)
-        return "Int32";
-      else
-        return "Int64";
-    }
+        unsigned NumBits = cast<IntegerType>(Ty)->getBitWidth();
+        if (NumBits <= 32) {
+          return "Int32";
+        } else {
+          return "Int64";
+        }
+      }
   }
 }
 
@@ -3005,7 +3131,7 @@ void CWriter::visitCastInst(CastInst &I) {
 
   bool ShouldCast = true;
   if (isa<PointerType>(DstTy)) {
-    PointerType* PTy = dyn_cast<PointerType>(DstTy);
+    PointerType *PTy = dyn_cast<PointerType>(DstTy);
     if (PTy && (PTy->getAddressSpace() != 0)) {
       ShouldCast = false;
     }
@@ -3017,8 +3143,9 @@ void CWriter::visitCastInst(CastInst &I) {
 
   // Make a sext from i1 work by subtracting the i1 from 0 (an int).
   if (SrcTy == Type::getInt1Ty(I.getContext()) &&
-      I.getOpcode() == Instruction::SExt)
+      I.getOpcode() == Instruction::SExt) {
     Out << "0-";
+  }
 
   writeOperand(I.getOperand(0));
 
@@ -3049,8 +3176,8 @@ void CWriter::visitSelectInst(SelectInst &I) {
 // (as defined in limits.h).
 static void printLimitValue(IntegerType &Ty, bool isSigned, bool isMax,
                             raw_ostream &Out) {
-  const char* type;
-  const char* sprefix = "";
+  const char *type;
+  const char *sprefix = "";
 
   unsigned NumBits = Ty.getBitWidth();
   if (NumBits <= 8) {
@@ -3066,10 +3193,11 @@ static void printLimitValue(IntegerType &Ty, bool isSigned, bool isMax,
     llvm_unreachable("Bit widths > 64 not implemented yet");
   }
 
-  if (isSigned)
+  if (isSigned) {
     Out << sprefix << type << (isMax ? "_MAX" : "_MIN");
-  else
+  } else {
     Out << "U" << type << (isMax ? "_MAX" : "0");
+  }
 }
 
 #ifndef NDEBUG
@@ -3090,56 +3218,56 @@ void CWriter::printIntrinsicDefinition(const Function &F, raw_ostream &Out) {
          elemT == funT->getParamType(0) && funT->getNumParams() == 2);
 
   switch (F.getIntrinsicID()) {
-  default:
-    llvm_unreachable("Unsupported Intrinsic.");
-  case Intrinsic::uadd_with_overflow:
-    // static inline Rty uadd_ixx(unsigned ixx a, unsigned ixx b) {
-    //   Rty r;
-    //   r.field0 = a + b;
-    //   r.field1 = (r.field0 < a);
-    //   return r;
-    // }
-    Out << "static inline ";
-    printType(Out, retT);
-    Out << GetValueName(&F);
-    Out << "(";
-    printSimpleType(Out, elemT, false);
-    Out << "a,";
-    printSimpleType(Out, elemT, false);
-    Out << "b) {\n  ";
-    printType(Out, retT);
-    Out << "r;\n";
-    Out << "  r.field0 = a + b;\n";
-    Out << "  r.field1 = (r.field0 < a);\n";
-    Out << "  return r;\n}\n";
-    break;
-    
-  case Intrinsic::sadd_with_overflow:            
-    // static inline Rty sadd_ixx(ixx a, ixx b) {
-    //   Rty r;
-    //   r.field1 = (b > 0 && a > XX_MAX - b) ||
-    //              (b < 0 && a < XX_MIN - b);
-    //   r.field0 = r.field1 ? 0 : a + b;
-    //   return r;
-    // }
-    Out << "static ";
-    printType(Out, retT);
-    Out << GetValueName(&F);
-    Out << "(";
-    printSimpleType(Out, elemT, true);
-    Out << "a,";
-    printSimpleType(Out, elemT, true);
-    Out << "b) {\n  ";
-    printType(Out, retT);
-    Out << "r;\n";
-    Out << "  r.field1 = (b > 0 && a > ";
-    printLimitValue(*elemT, true, true, Out);
-    Out << " - b) || (b < 0 && a < ";
-    printLimitValue(*elemT, true, false, Out);
-    Out << " - b);\n";
-    Out << "  r.field0 = r.field1 ? 0 : a + b;\n";
-    Out << "  return r;\n}\n";
-    break;
+    default:
+      llvm_unreachable("Unsupported Intrinsic.");
+    case Intrinsic::uadd_with_overflow:
+      // static inline Rty uadd_ixx(unsigned ixx a, unsigned ixx b) {
+      //   Rty r;
+      //   r.field0 = a + b;
+      //   r.field1 = (r.field0 < a);
+      //   return r;
+      // }
+      Out << "static inline ";
+      printType(Out, retT);
+      Out << GetValueName(&F);
+      Out << "(";
+      printSimpleType(Out, elemT, false);
+      Out << "a,";
+      printSimpleType(Out, elemT, false);
+      Out << "b) {\n  ";
+      printType(Out, retT);
+      Out << "r;\n";
+      Out << "  r.field0 = a + b;\n";
+      Out << "  r.field1 = (r.field0 < a);\n";
+      Out << "  return r;\n}\n";
+      break;
+
+    case Intrinsic::sadd_with_overflow:
+      // static inline Rty sadd_ixx(ixx a, ixx b) {
+      //   Rty r;
+      //   r.field1 = (b > 0 && a > XX_MAX - b) ||
+      //              (b < 0 && a < XX_MIN - b);
+      //   r.field0 = r.field1 ? 0 : a + b;
+      //   return r;
+      // }
+      Out << "static ";
+      printType(Out, retT);
+      Out << GetValueName(&F);
+      Out << "(";
+      printSimpleType(Out, elemT, true);
+      Out << "a,";
+      printSimpleType(Out, elemT, true);
+      Out << "b) {\n  ";
+      printType(Out, retT);
+      Out << "r;\n";
+      Out << "  r.field1 = (b > 0 && a > ";
+      printLimitValue(*elemT, true, true, Out);
+      Out << " - b) || (b < 0 && a < ";
+      printLimitValue(*elemT, true, false, Out);
+      Out << " - b);\n";
+      Out << "  r.field0 = r.field1 ? 0 : a + b;\n";
+      Out << "  return r;\n}\n";
+      break;
   }
 }
 
@@ -3147,69 +3275,73 @@ void CWriter::lowerIntrinsics(Function &F) {
   // This is used to keep track of intrinsics that get generated to a lowered
   // function. We must generate the prototypes before the function body which
   // will only be expanded on first use (by the loop below).
-  std::vector<Function*> prototypesToGen;
+  std::vector<Function *> prototypesToGen;
 
   // Examine all the instructions in this function to find the intrinsics that
   // need to be lowered.
   for (Function::iterator BB = F.begin(), EE = F.end(); BB != EE; ++BB)
-    for (BasicBlock::iterator I = BB->begin(), E = BB->end(); I != E; )
+    for (BasicBlock::iterator I = BB->begin(), E = BB->end(); I != E;)
       if (CallInst *CI = dyn_cast<CallInst>(I++))
         if (Function *F = CI->getCalledFunction())
           switch (F->getIntrinsicID()) {
-          case Intrinsic::not_intrinsic:
-          case Intrinsic::vastart:
-          case Intrinsic::vacopy:
-          case Intrinsic::vaend:
-          case Intrinsic::returnaddress:
-          case Intrinsic::frameaddress:
-          case Intrinsic::setjmp:
-          case Intrinsic::longjmp:
-          case Intrinsic::prefetch:
-          case Intrinsic::powi:
-          case Intrinsic::x86_sse_cmp_ss:
-          case Intrinsic::x86_sse_cmp_ps:
-          case Intrinsic::x86_sse2_cmp_sd:
-          case Intrinsic::x86_sse2_cmp_pd:
-          case Intrinsic::ppc_altivec_lvsl:
-          case Intrinsic::uadd_with_overflow:
-          case Intrinsic::sadd_with_overflow:
+            case Intrinsic::not_intrinsic:
+            case Intrinsic::vastart:
+            case Intrinsic::vacopy:
+            case Intrinsic::vaend:
+            case Intrinsic::returnaddress:
+            case Intrinsic::frameaddress:
+            case Intrinsic::setjmp:
+            case Intrinsic::longjmp:
+            case Intrinsic::prefetch:
+            case Intrinsic::powi:
+            case Intrinsic::x86_sse_cmp_ss:
+            case Intrinsic::x86_sse_cmp_ps:
+            case Intrinsic::x86_sse2_cmp_sd:
+            case Intrinsic::x86_sse2_cmp_pd:
+            case Intrinsic::ppc_altivec_lvsl:
+            case Intrinsic::uadd_with_overflow:
+            case Intrinsic::sadd_with_overflow:
               // We directly implement these intrinsics
-            break;
-          default:
-            // If this is an intrinsic that directly corresponds to a GCC
-            // builtin, we handle it.
-            const char *BuiltinName = "";
-            // If we handle it, don't lower it.
-            if (BuiltinName[0]) break;
+              break;
+            default:
+              // If this is an intrinsic that directly corresponds to a GCC
+              // builtin, we handle it.
+              const char *BuiltinName = "";
+              // If we handle it, don't lower it.
+              if (BuiltinName[0]) {
+                break;
+              }
 
-            // All other intrinsic calls we must lower.
-            Instruction *Before = 0;
-            if (CI != &BB->front())
-              Before = std::prev(BasicBlock::iterator(CI));
+              // All other intrinsic calls we must lower.
+              Instruction *Before = 0;
+              if (CI != &BB->front()) {
+                Before = std::prev(BasicBlock::iterator(CI));
+              }
 
-            IL->LowerIntrinsicCall(CI);
-            if (Before) {        // Move iterator to instruction after call
-              I = Before; ++I;
-            } else {
-              I = BB->begin();
-            }
-            // If the intrinsic got lowered to another call, and that call has
-            // a definition then we need to make sure its prototype is emitted
-            // before any calls to it.
-            if (CallInst *Call = dyn_cast<CallInst>(I))
-              if (Function *NewF = Call->getCalledFunction())
-                if (!NewF->isDeclaration())
-                  prototypesToGen.push_back(NewF);
+              IL->LowerIntrinsicCall(CI);
+              if (Before) {        // Move iterator to instruction after call
+                I = Before; ++I;
+              } else {
+                I = BB->begin();
+              }
+              // If the intrinsic got lowered to another call, and that call has
+              // a definition then we need to make sure its prototype is emitted
+              // before any calls to it.
+              if (CallInst *Call = dyn_cast<CallInst>(I))
+                if (Function *NewF = Call->getCalledFunction())
+                  if (!NewF->isDeclaration()) {
+                    prototypesToGen.push_back(NewF);
+                  }
 
-            break;
+              break;
           }
 
   // We may have collected some prototypes to emit in the loop above.
   // Emit them now, before the function that uses them is emitted. But,
   // be careful not to emit them twice.
-  std::vector<Function*>::iterator I = prototypesToGen.begin();
-  std::vector<Function*>::iterator E = prototypesToGen.end();
-  for ( ; I != E; ++I) {
+  std::vector<Function *>::iterator I = prototypesToGen.begin();
+  std::vector<Function *>::iterator E = prototypesToGen.end();
+  for (; I != E; ++I) {
     if (intrinsicPrototypesAlreadyGenerated.insert(*I).second) {
       Out << '\n';
       printFunctionSignature(*I, true);
@@ -3219,16 +3351,18 @@ void CWriter::lowerIntrinsics(Function &F) {
 }
 
 void CWriter::visitCallInst(CallInst &I) {
-  if (isa<InlineAsm>(I.getCalledValue()))
+  if (isa<InlineAsm>(I.getCalledValue())) {
     return visitInlineAsm(I);
+  }
 
   bool WroteCallee = false;
 
   // Handle intrinsic function calls first...
   if (Function *F = I.getCalledFunction())
     if (Intrinsic::ID ID = (Intrinsic::ID)F->getIntrinsicID())
-      if (visitBuiltinCall(I, ID, WroteCallee))
+      if (visitBuiltinCall(I, ID, WroteCallee)) {
         return;
+      }
 
   Value *Callee = I.getCalledValue();
 
@@ -3245,7 +3379,9 @@ void CWriter::visitCallInst(CallInst &I) {
     Out << " = ";
   }
 
-  if (I.isTailCall()) Out << " /*tail*/ ";
+  if (I.isTailCall()) {
+    Out << " /*tail*/ ";
+  }
 
   if (!WroteCallee) {
     // If this is an indirect call to a struct return function, we need to cast
@@ -3278,21 +3414,24 @@ void CWriter::visitCallInst(CallInst &I) {
       Out << "((";
       if (isStructRet)
         printStructReturnPointerFunctionType(Out, PAL,
-                             cast<PointerType>(I.getCalledValue()->getType()));
-      else if (hasByVal)
+                                             cast<PointerType>(I.getCalledValue()->getType()));
+      else if (hasByVal) {
         printType(Out, I.getCalledValue()->getType(), false, "", true, PAL);
-      else
+      } else {
         printType(Out, I.getCalledValue()->getType());
+      }
       Out << ")(void*)";
     }
     writeOperand(Callee);
-    if (NeedsCast) Out << ')';
+    if (NeedsCast) {
+      Out << ')';
+    }
   }
 
   Out << '(';
 
   bool PrintedArg = false;
-  if(FTy->isVarArg() && !FTy->getNumParams()) {
+  if (FTy->isVarArg() && !FTy->getNumParams()) {
     Out << "0 /*dummy arg*/";
     PrintedArg = true;
   }
@@ -3312,7 +3451,7 @@ void CWriter::visitCallInst(CallInst &I) {
     // Numerical values of CLK_LOCAL_MEM_FENCE and CLK_GLOBAL_MEM_FENCE can't be
     // determined before clBuildProgram() so we have to convert from integers
     // back to strings at this point.
-    assert(CS.arg_size() == 1 && "Incorrect number of arguments to barrier()!"); 
+    assert(CS.arg_size() == 1 && "Incorrect number of arguments to barrier()!");
     assert((*AI)->getType()->isIntegerTy() && "Illegal argument passed to barrier()!");
     ConstantInt *arg_value = dyn_cast_or_null<ConstantInt>(AI->get());
     assert(arg_value && "Can't extract integer value!");
@@ -3328,19 +3467,22 @@ void CWriter::visitCallInst(CallInst &I) {
     }
   } else {
     for (; AI != AE; ++AI, ++ArgNo) {
-      if (PrintedArg) Out << ", ";
+      if (PrintedArg) {
+        Out << ", ";
+      }
       if (ArgNo < NumDeclaredParams &&
           (*AI)->getType() != FTy->getParamType(ArgNo)) {
         Out << '(';
         printType(Out, FTy->getParamType(ArgNo),
-              /*isSigned=*/PAL.hasAttribute(ArgNo+1, Attribute::SExt));
+                  /*isSigned=*/PAL.hasAttribute(ArgNo + 1, Attribute::SExt));
         Out << ')';
       }
       // Check if the argument is expected to be passed by value.
-      if (I.paramHasAttr(ArgNo+1, Attribute::ByVal))
+      if (I.paramHasAttr(ArgNo + 1, Attribute::ByVal)) {
         writeOperandDeref(*AI);
-      else
+      } else {
         writeOperand(*AI);
+      }
       PrintedArg = true;
     }
   }
@@ -3353,140 +3495,143 @@ void CWriter::visitCallInst(CallInst &I) {
 bool CWriter::visitBuiltinCall(CallInst &I, Intrinsic::ID ID,
                                bool &WroteCallee) {
   switch (ID) {
-  default: {
-    // If this is an intrinsic that directly corresponds to a GCC
-    // builtin, we emit it here.
-    const char *BuiltinName = "";
-    assert(BuiltinName[0] && "Unknown LLVM intrinsic!");
+    default: {
+        // If this is an intrinsic that directly corresponds to a GCC
+        // builtin, we emit it here.
+        const char *BuiltinName = "";
+        assert(BuiltinName[0] && "Unknown LLVM intrinsic!");
 
-    Out << BuiltinName;
-    WroteCallee = true;
-    return false;
-  }
-  case Intrinsic::vastart:
-    Out << "0; ";
+        Out << BuiltinName;
+        WroteCallee = true;
+        return false;
+      }
+    case Intrinsic::vastart:
+      Out << "0; ";
 
-    Out << "va_start(*(va_list*)";
-    writeOperand(I.getArgOperand(0));
-    Out << ", ";
-    // Output the last argument to the enclosing function.
-    if (I.getParent()->getParent()->arg_empty())
-      Out << "vararg_dummy_arg";
-    else
-      writeOperand(--I.getParent()->getParent()->arg_end());
-    Out << ')';
-    return true;
-  case Intrinsic::vaend:
-    if (!isa<ConstantPointerNull>(I.getArgOperand(0))) {
-      Out << "0; va_end(*(va_list*)";
+      Out << "va_start(*(va_list*)";
+      writeOperand(I.getArgOperand(0));
+      Out << ", ";
+      // Output the last argument to the enclosing function.
+      if (I.getParent()->getParent()->arg_empty()) {
+        Out << "vararg_dummy_arg";
+      } else {
+        writeOperand(--I.getParent()->getParent()->arg_end());
+      }
+      Out << ')';
+      return true;
+    case Intrinsic::vaend:
+      if (!isa<ConstantPointerNull>(I.getArgOperand(0))) {
+        Out << "0; va_end(*(va_list*)";
+        writeOperand(I.getArgOperand(0));
+        Out << ')';
+      } else {
+        Out << "va_end(*(va_list*)0)";
+      }
+      return true;
+    case Intrinsic::vacopy:
+      Out << "0; ";
+      Out << "va_copy(*(va_list*)";
+      writeOperand(I.getArgOperand(0));
+      Out << ", *(va_list*)";
+      writeOperand(I.getArgOperand(1));
+      Out << ')';
+      return true;
+    case Intrinsic::returnaddress:
+      Out << "__builtin_return_address(";
       writeOperand(I.getArgOperand(0));
       Out << ')';
-    } else {
-      Out << "va_end(*(va_list*)0)";
-    }
-    return true;
-  case Intrinsic::vacopy:
-    Out << "0; ";
-    Out << "va_copy(*(va_list*)";
-    writeOperand(I.getArgOperand(0));
-    Out << ", *(va_list*)";
-    writeOperand(I.getArgOperand(1));
-    Out << ')';
-    return true;
-  case Intrinsic::returnaddress:
-    Out << "__builtin_return_address(";
-    writeOperand(I.getArgOperand(0));
-    Out << ')';
-    return true;
-  case Intrinsic::frameaddress:
-    Out << "__builtin_frame_address(";
-    writeOperand(I.getArgOperand(0));
-    Out << ')';
-    return true;
-  case Intrinsic::powi:
-    Out << "__builtin_powi(";
-    writeOperand(I.getArgOperand(0));
-    Out << ", ";
-    writeOperand(I.getArgOperand(1));
-    Out << ')';
-    return true;
-  case Intrinsic::setjmp:
-    Out << "setjmp(*(jmp_buf*)";
-    writeOperand(I.getArgOperand(0));
-    Out << ')';
-    return true;
-  case Intrinsic::longjmp:
-    Out << "longjmp(*(jmp_buf*)";
-    writeOperand(I.getArgOperand(0));
-    Out << ", ";
-    writeOperand(I.getArgOperand(1));
-    Out << ')';
-    return true;
-  case Intrinsic::prefetch:
-    Out << "LLVM_PREFETCH((const void *)";
-    writeOperand(I.getArgOperand(0));
-    Out << ", ";
-    writeOperand(I.getArgOperand(1));
-    Out << ", ";
-    writeOperand(I.getArgOperand(2));
-    Out << ")";
-    return true;
-  case Intrinsic::stacksave:
-    // Emit this as: Val = 0; *((void**)&Val) = __builtin_stack_save()
-    // to work around GCC bugs (see PR1809).
-    Out << "0; *((void**)&" << GetValueName(&I)
-        << ") = __builtin_stack_save()";
-    return true;
-  case Intrinsic::x86_sse_cmp_ss:
-  case Intrinsic::x86_sse_cmp_ps:
-  case Intrinsic::x86_sse2_cmp_sd:
-  case Intrinsic::x86_sse2_cmp_pd:
-    Out << '(';
-    printType(Out, I.getType());
-    Out << ')';
-    // Multiple GCC builtins multiplex onto this intrinsic.
-    switch (cast<ConstantInt>(I.getArgOperand(2))->getZExtValue()) {
-    default: llvm_unreachable("Invalid llvm.x86.sse.cmp!");
-    case 0: Out << "__builtin_ia32_cmpeq"; break;
-    case 1: Out << "__builtin_ia32_cmplt"; break;
-    case 2: Out << "__builtin_ia32_cmple"; break;
-    case 3: Out << "__builtin_ia32_cmpunord"; break;
-    case 4: Out << "__builtin_ia32_cmpneq"; break;
-    case 5: Out << "__builtin_ia32_cmpnlt"; break;
-    case 6: Out << "__builtin_ia32_cmpnle"; break;
-    case 7: Out << "__builtin_ia32_cmpord"; break;
-    }
-    if (ID == Intrinsic::x86_sse_cmp_ps || ID == Intrinsic::x86_sse2_cmp_pd)
-      Out << 'p';
-    else
-      Out << 's';
-    if (ID == Intrinsic::x86_sse_cmp_ss || ID == Intrinsic::x86_sse_cmp_ps)
-      Out << 's';
-    else
-      Out << 'd';
+      return true;
+    case Intrinsic::frameaddress:
+      Out << "__builtin_frame_address(";
+      writeOperand(I.getArgOperand(0));
+      Out << ')';
+      return true;
+    case Intrinsic::powi:
+      Out << "__builtin_powi(";
+      writeOperand(I.getArgOperand(0));
+      Out << ", ";
+      writeOperand(I.getArgOperand(1));
+      Out << ')';
+      return true;
+    case Intrinsic::setjmp:
+      Out << "setjmp(*(jmp_buf*)";
+      writeOperand(I.getArgOperand(0));
+      Out << ')';
+      return true;
+    case Intrinsic::longjmp:
+      Out << "longjmp(*(jmp_buf*)";
+      writeOperand(I.getArgOperand(0));
+      Out << ", ";
+      writeOperand(I.getArgOperand(1));
+      Out << ')';
+      return true;
+    case Intrinsic::prefetch:
+      Out << "LLVM_PREFETCH((const void *)";
+      writeOperand(I.getArgOperand(0));
+      Out << ", ";
+      writeOperand(I.getArgOperand(1));
+      Out << ", ";
+      writeOperand(I.getArgOperand(2));
+      Out << ")";
+      return true;
+    case Intrinsic::stacksave:
+      // Emit this as: Val = 0; *((void**)&Val) = __builtin_stack_save()
+      // to work around GCC bugs (see PR1809).
+      Out << "0; *((void**)&" << GetValueName(&I)
+          << ") = __builtin_stack_save()";
+      return true;
+    case Intrinsic::x86_sse_cmp_ss:
+    case Intrinsic::x86_sse_cmp_ps:
+    case Intrinsic::x86_sse2_cmp_sd:
+    case Intrinsic::x86_sse2_cmp_pd:
+      Out << '(';
+      printType(Out, I.getType());
+      Out << ')';
+      // Multiple GCC builtins multiplex onto this intrinsic.
+      switch (cast<ConstantInt>(I.getArgOperand(2))->getZExtValue()) {
+        default: llvm_unreachable("Invalid llvm.x86.sse.cmp!");
+        case 0: Out << "__builtin_ia32_cmpeq"; break;
+        case 1: Out << "__builtin_ia32_cmplt"; break;
+        case 2: Out << "__builtin_ia32_cmple"; break;
+        case 3: Out << "__builtin_ia32_cmpunord"; break;
+        case 4: Out << "__builtin_ia32_cmpneq"; break;
+        case 5: Out << "__builtin_ia32_cmpnlt"; break;
+        case 6: Out << "__builtin_ia32_cmpnle"; break;
+        case 7: Out << "__builtin_ia32_cmpord"; break;
+      }
+      if (ID == Intrinsic::x86_sse_cmp_ps || ID == Intrinsic::x86_sse2_cmp_pd) {
+        Out << 'p';
+      } else {
+        Out << 's';
+      }
+      if (ID == Intrinsic::x86_sse_cmp_ss || ID == Intrinsic::x86_sse_cmp_ps) {
+        Out << 's';
+      } else {
+        Out << 'd';
+      }
 
-    Out << "(";
-    writeOperand(I.getArgOperand(0));
-    Out << ", ";
-    writeOperand(I.getArgOperand(1));
-    Out << ")";
-    return true;
-  case Intrinsic::ppc_altivec_lvsl:
-    Out << '(';
-    printType(Out, I.getType());
-    Out << ')';
-    Out << "__builtin_altivec_lvsl(0, (void*)";
-    writeOperand(I.getArgOperand(0));
-    Out << ")";
-    return true;
-  case Intrinsic::uadd_with_overflow:
-  case Intrinsic::sadd_with_overflow:
-    Out << GetValueName(I.getCalledFunction()) << "(";
-    writeOperand(I.getArgOperand(0));
-    Out << ", ";
-    writeOperand(I.getArgOperand(1));
-    Out << ")";
-    return true;
+      Out << "(";
+      writeOperand(I.getArgOperand(0));
+      Out << ", ";
+      writeOperand(I.getArgOperand(1));
+      Out << ")";
+      return true;
+    case Intrinsic::ppc_altivec_lvsl:
+      Out << '(';
+      printType(Out, I.getType());
+      Out << ')';
+      Out << "__builtin_altivec_lvsl(0, (void*)";
+      writeOperand(I.getArgOperand(0));
+      Out << ")";
+      return true;
+    case Intrinsic::uadd_with_overflow:
+    case Intrinsic::sadd_with_overflow:
+      Out << GetValueName(I.getCalledFunction()) << "(";
+      writeOperand(I.getArgOperand(0));
+      Out << ", ";
+      writeOperand(I.getArgOperand(1));
+      Out << ")";
+      return true;
   }
 }
 
@@ -3494,7 +3639,7 @@ bool CWriter::visitBuiltinCall(CallInst &I, Intrinsic::ID ID,
 //TODO: work out platform independent constraints and factor those out
 //      of the per target tables
 //      handle multiple constraint codes
-std::string CWriter::InterpretASMConstraint(InlineAsm::ConstraintInfo& c) {
+std::string CWriter::InterpretASMConstraint(InlineAsm::ConstraintInfo &c) {
   assert(0 && "FIXME: Execute CWriter::InterpretASMConstraint\n");
   assert(c.Codes.size() == 1 && "Too many asm constraint codes to handle");
 
@@ -3502,14 +3647,16 @@ std::string CWriter::InterpretASMConstraint(InlineAsm::ConstraintInfo& c) {
   // Grab the translation table from MCAsmInfo if it exists.
   const MCAsmInfo *TargetAsm;
   std::string Triple = TheModule->getTargetTriple();
-  if (Triple.empty())
+  if (Triple.empty()) {
     Triple = llvm::sys::getDefaultTargetTriple();
+  }
 
   std::string E;
-  if (const Target *Match = TargetRegistry::lookupTarget(Triple, E))
+  if (const Target *Match = TargetRegistry::lookupTarget(Triple, E)) {
     TargetAsm = Match->createMCAsmInfo(Triple);
-  else
+  } else {
     return c.Codes[0];
+  }
 #if 0
   const char *const *table = TargetAsm->getAsmCBE();
 
@@ -3517,7 +3664,7 @@ std::string CWriter::InterpretASMConstraint(InlineAsm::ConstraintInfo& c) {
   for (int i = 0; table && table[i]; i += 2)
     if (c.Codes[0] == table[i]) {
       delete TargetAsm;
-      return table[i+1];
+      return table[i + 1];
     }
 #endif
   // Default is identity.
@@ -3529,24 +3676,26 @@ std::string CWriter::InterpretASMConstraint(InlineAsm::ConstraintInfo& c) {
 //TODO: import logic from AsmPrinter.cpp
 static std::string gccifyAsm(std::string asmstr) {
   for (std::string::size_type i = 0; i != asmstr.size(); ++i)
-    if (asmstr[i] == '\n')
+    if (asmstr[i] == '\n') {
       asmstr.replace(i, 1, "\\n");
-    else if (asmstr[i] == '\t')
+    } else if (asmstr[i] == '\t') {
       asmstr.replace(i, 1, "\\t");
-    else if (asmstr[i] == '$') {
+    } else if (asmstr[i] == '$') {
       if (asmstr[i + 1] == '{') {
         std::string::size_type a = asmstr.find_first_of(':', i + 1);
         std::string::size_type b = asmstr.find_first_of('}', i + 1);
         std::string n = "%" +
-          asmstr.substr(a + 1, b - a - 1) +
-          asmstr.substr(i + 2, a - i - 2);
+                        asmstr.substr(a + 1, b - a - 1) +
+                        asmstr.substr(i + 2, a - i - 2);
         asmstr.replace(i, b - i + 1, n);
         i += n.size() - 1;
-      } else
+      } else {
         asmstr.replace(i, 1, "%");
+      }
+    } else if (asmstr[i] == '%') { //grr
+      asmstr.replace(i, 1, "%%");
+      ++i;
     }
-    else if (asmstr[i] == '%')//grr
-      { asmstr.replace(i, 1, "%%"); ++i;}
 
   return asmstr;
 }
@@ -3554,15 +3703,16 @@ static std::string gccifyAsm(std::string asmstr) {
 //TODO: assumptions about what consume arguments from the call are likely wrong
 //      handle communitivity
 void CWriter::visitInlineAsm(CallInst &CI) {
-  InlineAsm* as = cast<InlineAsm>(CI.getCalledValue());
+  InlineAsm *as = cast<InlineAsm>(CI.getCalledValue());
   InlineAsm::ConstraintInfoVector Constraints = as->ParseConstraints();
 
-  std::vector<std::pair<Value*, int> > ResultVals;
+  std::vector<std::pair<Value *, int> > ResultVals;
   if (CI.getType() == Type::getVoidTy(CI.getContext()))
     ;
   else if (StructType *ST = dyn_cast<StructType>(CI.getType())) {
-    for (unsigned i = 0, e = ST->getNumElements(); i != e; ++i)
+    for (unsigned i = 0, e = ST->getNumElements(); i != e; ++i) {
       ResultVals.push_back(std::make_pair(&CI, (int)i));
+    }
   } else {
     ResultVals.push_back(std::make_pair(&CI, -1));
   }
@@ -3585,7 +3735,9 @@ void CWriter::visitInlineAsm(CallInst &CI) {
 
     assert(I->Codes.size() == 1 && "Too many asm constraint codes to handle");
     std::string C = InterpretASMConstraint(*I);
-    if (C.empty()) continue;
+    if (C.empty()) {
+      continue;
+    }
 
     if (!IsFirst) {
       Out << ", ";
@@ -3599,15 +3751,18 @@ void CWriter::visitInlineAsm(CallInst &CI) {
     if (ValueCount < ResultVals.size()) {
       DestVal = ResultVals[ValueCount].first;
       DestValNo = ResultVals[ValueCount].second;
-    } else
-      DestVal = CI.getArgOperand(ValueCount-ResultVals.size());
+    } else {
+      DestVal = CI.getArgOperand(ValueCount - ResultVals.size());
+    }
 
-    if (I->isEarlyClobber)
-      C = "&"+C;
+    if (I->isEarlyClobber) {
+      C = "&" + C;
+    }
 
     Out << "\"=" << C << "\"(" << GetValueName(DestVal);
-    if (DestValNo != -1)
-      Out << ".field" << DestValNo; // Multiple retvals.
+    if (DestValNo != -1) {
+      Out << ".field" << DestValNo;  // Multiple retvals.
+    }
     Out << ")";
     ++ValueCount;
   }
@@ -3626,7 +3781,9 @@ void CWriter::visitInlineAsm(CallInst &CI) {
 
     assert(I->Codes.size() == 1 && "Too many asm constraint codes to handle");
     std::string C = InterpretASMConstraint(*I);
-    if (C.empty()) continue;
+    if (C.empty()) {
+      continue;
+    }
 
     if (!IsFirst) {
       Out << ", ";
@@ -3634,13 +3791,14 @@ void CWriter::visitInlineAsm(CallInst &CI) {
     }
 
     assert(ValueCount >= ResultVals.size() && "Input can't refer to result");
-    Value *SrcVal = CI.getArgOperand(ValueCount-ResultVals.size());
+    Value *SrcVal = CI.getArgOperand(ValueCount - ResultVals.size());
 
     Out << "\"" << C << "\"(";
-    if (!I->isIndirect)
+    if (!I->isIndirect) {
       writeOperand(SrcVal);
-    else
+    } else {
       writeOperandDeref(SrcVal);
+    }
     Out << ")";
   }
 
@@ -3648,12 +3806,15 @@ void CWriter::visitInlineAsm(CallInst &CI) {
   IsFirst = true;
   for (InlineAsm::ConstraintInfoVector::iterator I = Constraints.begin(),
        E = Constraints.end(); I != E; ++I) {
-    if (I->Type != InlineAsm::isClobber)
+    if (I->Type != InlineAsm::isClobber) {
       continue;  // Ignore non-input constraints.
+    }
 
     assert(I->Codes.size() == 1 && "Too many asm constraint codes to handle");
     std::string C = InterpretASMConstraint(*I);
-    if (C.empty()) continue;
+    if (C.empty()) {
+      continue;
+    }
 
     if (!IsFirst) {
       Out << ", ";
@@ -3693,8 +3854,9 @@ void CWriter::printGEPExpression(Value *Ptr, gep_type_iterator I,
   // last index could possibly be of a vector element.
   VectorType *LastIndexIsVector = 0;
   {
-    for (gep_type_iterator TmpI = I; TmpI != E; ++TmpI)
+    for (gep_type_iterator TmpI = I; TmpI != E; ++TmpI) {
       LastIndexIsVector = dyn_cast<VectorType>(*TmpI);
+    }
   }
 
   Out << "(";
@@ -3730,8 +3892,9 @@ void CWriter::printGEPExpression(Value *Ptr, gep_type_iterator I,
       writeOperand(Ptr);
       Out << "->field" << cast<ConstantInt>(I.getOperand())->getZExtValue();
       ++I;  // eat the struct index as well.
-      if ((*I)->isArrayTy())
-	IsUserDefinedStructOfArray = true;
+      if ((*I)->isArrayTy()) {
+        IsUserDefinedStructOfArray = true;
+      }
 
     } else {
       // Instead of emitting P[0][1], emit (*P)[1], which is more idiomatic.
@@ -3748,12 +3911,14 @@ void CWriter::printGEPExpression(Value *Ptr, gep_type_iterator I,
       // but for arrays that are enclosed in a user-defined structure,
       // we will see struct.array in GEP
       gep_type_iterator J = I;
-      if (++J != E && ((*J)->isArrayTy()))
-    IsUserDefinedStructOfArray = true;
+      if (++J != E && ((*J)->isArrayTy())) {
+        IsUserDefinedStructOfArray = true;
+      }
       Out << ".field" << cast<ConstantInt>(I.getOperand())->getZExtValue();
     } else if ((*I)->isArrayTy()) {
-      if (!IsUserDefinedStructOfArray)
-    Out << ".field0";
+      if (!IsUserDefinedStructOfArray) {
+        Out << ".field0";
+      }
       Out << ".array[";
       writeOperandWithCast(I.getOperand(), Instruction::GetElementPtr);
       Out << ']';
@@ -3782,7 +3947,7 @@ void CWriter::writeMemoryAccess(Value *Operand, Type *OperandType,
                                 bool IsVolatile, unsigned Alignment) {
 #if 0
   bool IsUnaligned = Alignment &&
-    Alignment < TD->getABITypeAlignment(OperandType);
+                     Alignment < TD->getABITypeAlignment(OperandType);
 
   if (!IsUnaligned)
 #endif
@@ -3790,12 +3955,15 @@ void CWriter::writeMemoryAccess(Value *Operand, Type *OperandType,
 #if 0
   if (IsVolatile || IsUnaligned) {
     Out << "((";
-    if (IsUnaligned)
+    if (IsUnaligned) {
       Out << "struct __attribute__ ((packed, aligned(" << Alignment << "))) {";
+    }
     printType(Out, OperandType, false, IsUnaligned ? "data" : "volatile*");
     if (IsUnaligned) {
       Out << "; } ";
-      if (IsVolatile) Out << "volatile ";
+      if (IsVolatile) {
+        Out << "volatile ";
+      }
       Out << "*";
     }
     Out << ")";
@@ -3806,8 +3974,9 @@ void CWriter::writeMemoryAccess(Value *Operand, Type *OperandType,
 #if 0
   if (IsVolatile || IsUnaligned) {
     Out << ')';
-    if (IsUnaligned)
+    if (IsUnaligned) {
       Out << "->data";
+    }
   }
 #endif
 }
@@ -3830,17 +3999,20 @@ void CWriter::visitStoreInst(StoreInst &I) {
     Out << "))";
   } else {
     writeMemoryAccess(I.getPointerOperand(), I.getOperand(0)->getType(),
-                    I.isVolatile(), I.getAlignment());
+                      I.isVolatile(), I.getAlignment());
     Out << " = ";
     Value *Operand = I.getOperand(0);
     Constant *BitMask = 0;
-    if (IntegerType* ITy = dyn_cast<IntegerType>(Operand->getType()))
+    if (IntegerType *ITy = dyn_cast<IntegerType>(Operand->getType()))
       if (!ITy->isPowerOf2ByteWidth())
         // We have a bit width that doesn't match an even power-of-2 byte
         // size. Consequently we must & the value with the type's bit mask
+      {
         BitMask = ConstantInt::get(ITy, ITy->getBitMask());
-    if (BitMask)
+      }
+    if (BitMask) {
       Out << "((";
+    }
     writeOperand(Operand);
     if (BitMask) {
       Out << ") & ";
@@ -3896,9 +4068,11 @@ void CWriter::visitShuffleVectorInst(ShuffleVectorInst &SVI) {
   Type *EltTy = VT->getElementType();
 
   for (unsigned i = 0; i != NumElts; ++i) {
-    if (i) Out << ", ";
+    if (i) {
+      Out << ", ";
+    }
     int SrcVal = SVI.getMaskValue(i);
-    if ((unsigned)SrcVal >= NumElts*2) {
+    if ((unsigned)SrcVal >= NumElts * 2) {
       Out << " 0/*undef*/ ";
     } else {
       Value *Op = SVI.getOperand((unsigned)SrcVal >= NumElts);
@@ -3907,12 +4081,12 @@ void CWriter::visitShuffleVectorInst(ShuffleVectorInst &SVI) {
         Out << "((";
         printType(Out, PointerType::getUnqual(EltTy));
         Out << ")(&" << GetValueName(Op)
-            << "))[" << (SrcVal & (NumElts-1)) << "]";
+            << "))[" << (SrcVal & (NumElts - 1)) << "]";
       } else if (isa<ConstantAggregateZero>(Op) || isa<UndefValue>(Op)) {
         Out << "0";
       } else {
         printConstant(cast<ConstantVector>(Op)->getOperand(SrcVal &
-                                                           (NumElts-1)),
+                      (NumElts - 1)),
                       false);
       }
     }
@@ -3931,11 +4105,12 @@ void CWriter::visitInsertValueInst(InsertValueInst &IVI) {
        i != e; ++i) {
     Type *IndexedTy =
       ExtractValueInst::getIndexedType(IVI.getOperand(0)->getType(),
-                                       makeArrayRef(b, i+1));
-    if (IndexedTy->isArrayTy())
+                                       makeArrayRef(b, i + 1));
+    if (IndexedTy->isArrayTy()) {
       Out << ".array[" << *i << "]";
-    else
+    } else {
       Out << ".field" << *i;
+    }
   }
   Out << " = ";
   writeOperand(IVI.getOperand(1));
@@ -3953,11 +4128,12 @@ void CWriter::visitExtractValueInst(ExtractValueInst &EVI) {
          i != e; ++i) {
       Type *IndexedTy =
         ExtractValueInst::getIndexedType(EVI.getOperand(0)->getType(),
-                                         makeArrayRef(b, i+1));
-      if (IndexedTy->isArrayTy())
+                                         makeArrayRef(b, i + 1));
+      if (IndexedTy->isArrayTy()) {
         Out << ".array[" << *i << "]";
-      else
+      } else {
         Out << ".field" << *i;
+      }
     }
   }
   Out << ")";
@@ -3968,34 +4144,37 @@ void CWriter::run(const Module &M, bool onlyNamed) {
 
   // Get types from global variables.
   for (Module::const_global_iterator I = M.global_begin(),
-         E = M.global_end(); I != E; ++I) {
+       E = M.global_end(); I != E; ++I) {
     incorporateType(M, I->getType());
-    if (I->hasInitializer())
+    if (I->hasInitializer()) {
       incorporateValue(M, I->getInitializer());
+    }
   }
 
   // Get types from aliases.
   for (Module::const_alias_iterator I = M.alias_begin(),
-         E = M.alias_end(); I != E; ++I) {
+       E = M.alias_end(); I != E; ++I) {
     incorporateType(M, I->getType());
-    if (const Value *Aliasee = I->getAliasee())
+    if (const Value *Aliasee = I->getAliasee()) {
       incorporateValue(M, Aliasee);
+    }
   }
 
   // Get types from functions.
-  SmallVector<std::pair<unsigned, MDNode*>, 4> MDForInst;
+  SmallVector<std::pair<unsigned, MDNode *>, 4> MDForInst;
   for (Module::const_iterator FI = M.begin(), E = M.end(); FI != E; ++FI) {
     incorporateType(M, FI->getType());
 
     // First incorporate the arguments.
     for (Function::const_arg_iterator AI = FI->arg_begin(),
-           AE = FI->arg_end(); AI != AE; ++AI)
+         AE = FI->arg_end(); AI != AE; ++AI) {
       incorporateValue(M, AI);
+    }
 
     for (Function::const_iterator BB = FI->begin(), E = FI->end();
-         BB != E;++BB)
+         BB != E; ++BB)
       for (BasicBlock::const_iterator II = BB->begin(),
-             E = BB->end(); II != E; ++II) {
+           E = BB->end(); II != E; ++II) {
         const Instruction &I = *II;
 
         // Incorporate the type of the instruction.
@@ -4005,23 +4184,26 @@ void CWriter::run(const Module &M, bool onlyNamed) {
         // instructions with this loop.)
         for (User::const_op_iterator OI = I.op_begin(), OE = I.op_end();
              OI != OE; ++OI)
-          if (!isa<Instruction>(OI))
+          if (!isa<Instruction>(OI)) {
             incorporateValue(M, *OI);
+          }
 
         // Incorporate types hiding in metadata.
         I.getAllMetadataOtherThanDebugLoc(MDForInst);
-        for (unsigned i = 0, e = MDForInst.size(); i != e; ++i)
+        for (unsigned i = 0, e = MDForInst.size(); i != e; ++i) {
           incorporateMDNode(M, MDForInst[i].second);
+        }
 
         MDForInst.clear();
       }
   }
 
   for (Module::const_named_metadata_iterator I = M.named_metadata_begin(),
-         E = M.named_metadata_end(); I != E; ++I) {
+       E = M.named_metadata_end(); I != E; ++I) {
     const NamedMDNode *NMD = I;
-    for (unsigned i = 0, e = NMD->getNumOperands(); i != e; ++i)
+    for (unsigned i = 0, e = NMD->getNumOperands(); i != e; ++i) {
       incorporateMDNode(M, NMD->getOperand(i));
+    }
   }
 }
 /*
@@ -4033,26 +4215,29 @@ void TypeFinder::clear() {
 */
 /// incorporateType - This method adds the type to the list of used structures
 /// if it's not in there already.
-void CWriter::incorporateType(const Module &M,Type *Ty) {
+void CWriter::incorporateType(const Module &M, Type *Ty) {
   // Check to see if we're already visited this type.
-  if (!VisitedTypes.insert(Ty).second)
+  if (!VisitedTypes.insert(Ty).second) {
     return;
+  }
 
   // If this is a structure or opaque type, add a name for the type.
   if (StructType *STy = dyn_cast<StructType>(Ty))
-    if (!OnlyNamed || STy->hasName())
+    if (!OnlyNamed || STy->hasName()) {
       StructTypes.push_back(STy);
+    }
 
   if (ArrayType *ATy = dyn_cast<ArrayType>(Ty)) {
-    std::vector<Type*> structMembers;
+    std::vector<Type *> structMembers;
     structMembers.push_back(ATy);
     StructTypes.push_back(StructType::get(M.getContext(), structMembers));
-      }
+  }
 
   // Recursively walk all contained types.
   for (Type::subtype_iterator I = Ty->subtype_begin(),
-         E = Ty->subtype_end(); I != E; ++I)
+       E = Ty->subtype_end(); I != E; ++I) {
     incorporateType(M, *I);
+  }
 }
 
 /// incorporateValue - This method is used to walk operand lists finding types
@@ -4060,40 +4245,48 @@ void CWriter::incorporateType(const Module &M,Type *Ty) {
 /// other ways.  GlobalValues, basic blocks, instructions, and inst operands are
 /// all explicitly enumerated.
 void CWriter::incorporateValue(const Module &M, const Value *V) {
-  if (const MDNode *MNe = dyn_cast<MDNode>(V))
+  if (const MDNode *MNe = dyn_cast<MDNode>(V)) {
     return incorporateMDNode(M, MNe);
+  }
 
-  if (!isa<Constant>(V) || isa<GlobalValue>(V)) return;
+  if (!isa<Constant>(V) || isa<GlobalValue>(V)) {
+    return;
+  }
 
   // Already visited?
-  if (!VisitedConstants.insert(V).second)
+  if (!VisitedConstants.insert(V).second) {
     return;
+  }
 
   // Check this type.
   incorporateType(M, V->getType());
 
   // If this is an instruction, we incorporate it separately.
-  if (isa<Instruction>(V))
+  if (isa<Instruction>(V)) {
     return;
+  }
 
   // Look in operands for types.
   const User *U = cast<User>(V);
   for (Constant::const_op_iterator I = U->op_begin(),
-         E = U->op_end(); I != E;++I)
+       E = U->op_end(); I != E; ++I) {
     incorporateValue(M, *I);
+  }
 }
 
 /// incorporateMDNode - This method is used to walk the operands of an MDNode to
 /// find types hiding within.
 void CWriter::incorporateMDNode(const Module &M, const MDNode *V) {
   // Already visited?
-  if (!VisitedConstants.insert(V).second)
+  if (!VisitedConstants.insert(V).second) {
     return;
+  }
 
   // Look in operands for types.
   for (unsigned i = 0, e = V->getNumOperands(); i != e; ++i)
-    if (Value *Op = V->getOperand(i))
+    if (Value *Op = V->getOperand(i)) {
       incorporateValue(M, Op);
+    }
 }
 
 //===----------------------------------------------------------------------===//
@@ -4101,12 +4294,14 @@ void CWriter::incorporateMDNode(const Module &M, const MDNode *V) {
 //===----------------------------------------------------------------------===//
 
 bool CTargetMachine::addPassesToEmitFile(PassManagerBase &PM,
-                                         formatted_raw_ostream &o,
-                                         CodeGenFileType FileType,
-                                         bool DisableVerify,
-                                         AnalysisID StartAfter,
-                                         AnalysisID StopAfter) {
-  if (FileType != TargetMachine::CGFT_AssemblyFile) return true;
+    formatted_raw_ostream &o,
+    CodeGenFileType FileType,
+    bool DisableVerify,
+    AnalysisID StartAfter,
+    AnalysisID StopAfter) {
+  if (FileType != TargetMachine::CGFT_AssemblyFile) {
+    return true;
+  }
 
   PM.add(createGCLoweringPass());
   PM.add(createLowerInvokePass());
