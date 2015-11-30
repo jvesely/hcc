@@ -2053,7 +2053,11 @@ bool CWriter::doInitialization(Module &M) {
   // Initialize
   TheModule = &M;
   StringRef filename = llvm::sys::path::filename(M.getModuleIdentifier());
-  bcHash = filename.substr(0, filename.find("."));
+  if ("<stdin>" == filename) {
+    bcHash = "";
+  } else {
+    bcHash = filename.substr(0, filename.find("."));
+  }
 
   TD = new DataLayout(&M);
   IL = new IntrinsicLowering(*TD);
