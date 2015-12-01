@@ -1,3 +1,4 @@
+#ifndef QUERIES
 
 /**
  * work-item related functions
@@ -720,3 +721,5 @@ static unsigned char * memcpy(unsigned char *dst,  __global unsigned char *src, 
   }
   return dst;
 }
+
+#endif

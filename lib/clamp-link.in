@@ -227,6 +227,10 @@ if [ -n "$LINK_KERNEL_ARGS" ]; then
     else
       $CLAMP_DEVICE $TEMP_DIR/kernel.bc $TEMP_DIR/kernel.cl --opencl --verbose
     fi
+    if [ $CMP_KEEP == 1 ]; then
+      md5Value=`md5sum $TEMP_DIR/kernel.cl | cut -d' ' -f1`
+      cp $TEMP_DIR/kernel.cl ./$md5Value.cl
+    fi
     ret=$?
     if [ $ret == 0 ]; then
       # build a new kernel object
