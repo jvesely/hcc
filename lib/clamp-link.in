@@ -61,7 +61,6 @@ fi
 ################
 
 VERBOSE=0
-KEEP=0
 
 ################
 # GPU targets
@@ -181,8 +180,6 @@ do
     fi
   elif [ $ARG == "--verbose" ]; then
     VERBOSE=1
-  elif [ $ARG == "--keep" ]; then
-    KEEP=1
   elif [ $ARG == "--disable-opencl" ]; then
     LOWER_OPENCL=0
   elif [ $ARG == "--disable-hsa" ]; then
@@ -230,7 +227,7 @@ if [ -n "$LINK_KERNEL_ARGS" ]; then
     else
       $CLAMP_DEVICE $TEMP_DIR/kernel.bc $TEMP_DIR/kernel.cl --opencl --verbose
     fi
-    if [ $KEEP == 1 ]; then
+    if [ $CMP_KEEP == 1 ]; then
       md5Value=`md5sum $TEMP_DIR/kernel.cl | cut -d' ' -f1`
       cp $TEMP_DIR/kernel.cl ./$md5Value.cl
     fi

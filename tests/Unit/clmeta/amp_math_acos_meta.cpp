@@ -1,5 +1,7 @@
-// RUN: %cxxamp --keep %s -o %t.out
+// RUN: export CMP_KEEP=1
+// RUN: %cxxamp %s -o %t.out
 // RUN: %clmeta -x c -DQUERIES -c ./ff2f6b04bf6e1c2fd3ac92f55ef85b58.cl -o %t1.cl.o
+// RUN: rm ./ff2f6b04bf6e1c2fd3ac92f55ef85b58.cl
 // RUN: %gtest_amp -DDQUERIES %s %t1.cl.o -o %t1 && %t1
 
 #include <amp.h>
