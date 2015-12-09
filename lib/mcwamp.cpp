@@ -41,8 +41,14 @@ extern "C" char * hsa_kernel_source[] asm ("_binary_kernel_brig_start") __attrib
 extern "C" char * hsa_kernel_end[] asm ("_binary_kernel_brig_end") __attribute__((weak));
 
 // HSA offline finalized kernel codes
-extern "C" char * hsa_offline_finalized_kernel_source[] asm ("_binary_kernel_isa_start") __attribute__((weak));
-extern "C" char * hsa_offline_finalized_kernel_end[] asm ("_binary_kernel_isa_end") __attribute__((weak));
+// FIXME: hard-coded to support Kaveri, Carrizo, Fiji now
+// need a way to smartly find out what kernels are available
+extern "C" char * hsa_offline_finalized_Kaveri_kernel_source[] asm ("_binary_kernel_Kaveri_isa_start") __attribute__((weak));
+extern "C" char * hsa_offline_finalized_Kaveri_kernel_end[] asm ("_binary_kernel_Kaveri_isa_end") __attribute__((weak));
+extern "C" char * hsa_offline_finalized_Carrizo_kernel_source[] asm ("_binary_kernel_Carrizo_isa_start") __attribute__((weak));
+extern "C" char * hsa_offline_finalized_Carrizo_kernel_end[] asm ("_binary_kernel_Carrizo_isa_end") __attribute__((weak));
+extern "C" char * hsa_offline_finalized_Fiji_kernel_source[] asm ("_binary_kernel_Fiji_isa_start") __attribute__((weak));
+extern "C" char * hsa_offline_finalized_Fiji_kernel_end[] asm ("_binary_kernel_Fiji_isa_end") __attribute__((weak));
 
 // interface of C++AMP runtime implementation
 struct RuntimeImpl {
@@ -310,6 +316,7 @@ void *CreateKernel(std::string s, KalmarQueue* pQueue) {
 
   char* kernel_env = nullptr;
   size_t kernel_size = 0;
+  void* kernel_pointer = nullptr;
 
   // FIXME need a more elegant way
   if (GetOrInitRuntime()->m_ImplName.find("libmcwamp_opencl") != std::string::npos) {
@@ -337,14 +344,16 @@ void *CreateKernel(std::string s, KalmarQueue* pQueue) {
       kernel_size =
         (ptrdiff_t)((void *)spir_kernel_end) -
         (ptrdiff_t)((void *)spir_kernel_source);
-      return pQueue->getDev()->CreateKernel(s.c_str(), (void *)kernel_size, spir_kernel_source, true);
+      kernel_pointer = spir_kernel_source;
     } else {
       // OpenCL path
       kernel_size =
         (ptrdiff_t)((void *)cl_kernel_end) -
         (ptrdiff_t)((void *)cl_kernel_source);
-      return pQueue->getDev()->CreateKernel(s.c_str(), (void *)kernel_size, cl_kernel_source, true);
+      kernel_pointer = cl_kernel_source;
     }
+    return pQueue->getDev()->CreateKernel(s.c_str(), (void *)kernel_size, spir_kernel_source, true);
+
   } else {
     // HSA path
 
@@ -353,19 +362,37 @@ void *CreateKernel(std::string s, KalmarQueue* pQueue) {
       kernel_env = getenv("HCC_NOISA");
       if (kernel_env == nullptr) {
         // check if offline finalized kernels are available
-        size_t kernel_finalized_size = 
-          (ptrdiff_t)((void *)hsa_offline_finalized_kernel_end) -
-          (ptrdiff_t)((void *)hsa_offline_finalized_kernel_source);
-        // check if offline finalized kernel is compatible with ISA of the HSA agent
-        if ((kernel_finalized_size > 0) &&
-            (pQueue->getDev()->IsCompatibleKernel((void*)kernel_finalized_size, hsa_offline_finalized_kernel_source))) {
-          if (mcwamp_verbose)
-            std::cout << "Use offline finalized HSA kernels\n";
-          hasFinalized = true;
-        } else {
-          if (mcwamp_verbose)
-            std::cout << "Use HSA BRIG kernel\n";
+        // precedence: Fiji -> Kaveri -> Carrizo
+        for (int i = 0; i < 3; ++i) {
+          switch (i) {
+            case 0:
+              kernel_size = (ptrdiff_t)((void *)hsa_offline_finalized_Fiji_kernel_end) -
+                            (ptrdiff_t)((void *)hsa_offline_finalized_Fiji_kernel_source);
+              kernel_pointer = hsa_offline_finalized_Fiji_kernel_source;
+            break;
+            case 1:
+              kernel_size = (ptrdiff_t)((void *)hsa_offline_finalized_Kaveri_kernel_end) -
+                            (ptrdiff_t)((void *)hsa_offline_finalized_Kaveri_kernel_source);
+              kernel_pointer = hsa_offline_finalized_Kaveri_kernel_source;
+            break;
+            case 2:
+              kernel_size = (ptrdiff_t)((void *)hsa_offline_finalized_Carrizo_kernel_end) -
+                            (ptrdiff_t)((void *)hsa_offline_finalized_Carrizo_kernel_source);
+              kernel_pointer = hsa_offline_finalized_Carrizo_kernel_source;
+            break;
+          }
+          // check if offline finalized kernel is compatible with ISA of the HSA agent
+          if ((kernel_size > 0) &&
+              (pQueue->getDev()->IsCompatibleKernel((void*)kernel_size, kernel_pointer))) {
+            if (mcwamp_verbose)
+              std::cout << "Use offline finalized HSA kernels\n";
+            hasFinalized = true;
+            break;
+          }
         }
+        // no offline finalized kernels is suitable, fallback to HSA BRIG
+        if (!hasFinalized && mcwamp_verbose)
+          std::cout << "Use HSA BRIG kernel\n";
       } else {
         // force use BRIG kernel
         if (mcwamp_verbose)
@@ -374,10 +401,7 @@ void *CreateKernel(std::string s, KalmarQueue* pQueue) {
       firstTime = false;
     }
     if (hasFinalized) {
-      kernel_size =
-        (ptrdiff_t)((void *)hsa_offline_finalized_kernel_end) -
-        (ptrdiff_t)((void *)hsa_offline_finalized_kernel_source);
-      return pQueue->getDev()->CreateKernel(s.c_str(), (void *)kernel_size, hsa_offline_finalized_kernel_source, false);
+      return pQueue->getDev()->CreateKernel(s.c_str(), (void *)kernel_size, kernel_pointer, false);
     } else {
       kernel_size = 
         (ptrdiff_t)((void *)hsa_kernel_end) -

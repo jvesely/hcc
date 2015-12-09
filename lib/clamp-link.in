@@ -266,43 +266,43 @@ if [ -n "$LINK_KERNEL_ARGS" ]; then
   fi
 
   # HSA offline finalization
+  HOF_OBJECT_LIST=""
   if [ $LOWER_HSA == 1 ] && [ $LOWER_HOF == 1 ]; then
     # conduct HSA offline finalization
-    $HOF_BIN/hof -output=$TEMP_DIR/kernel.isa -brig $TEMP_DIR/kernel.brig
+    # Kaveri and Bonaire (7:0:0)
+    # Carrizo (8:0:1)
+    # Fiji (AMD:AMDGPU:8:0:3) NOT YET SUPPORTED by HOF posted on Github
+    HSA_ISA_TARGET_ARCH=(7:0:0 8:0:1)
+    HSA_ISA_TARGET_NAME=(Kaveri Carrizo)
 
-    ##
-    # Lines below are not yet applicable for hof posted on Github
-    ##
+    for (( i=0; i<${#HSA_ISA_TARGET_ARCH[@]}; i++)); do
+      TARGET_ARCH=${HSA_ISA_TARGET_ARCH[$i]}
+      TARGET_NAME=${HSA_ISA_TARGET_NAME[$i]}
+      $HOF_BIN/hof -target=$TARGET_ARCH -output=$TEMP_DIR/kernel_$TARGET_NAME.isa -brig $TEMP_DIR/kernel.brig
+      ret=$?
+      if [ $ret == 0 ]; then
+        # build a new kernel object
+        pushd . > /dev/null
+        cd $TEMP_DIR
+        $CLAMP_EMBED kernel_$TARGET_NAME.isa kernel_$TARGET_NAME.o
+        HOF_OBJECT_LIST+=$TEMP_DIR/kernel_$TARGET_NAME.o
+        HOF_OBJECT_LIST+=" "
+        popd > /dev/null
 
-    # Kaveri
-    #HOF_ARCH="AMD:AMDGPU:7:0:0"
-     
-    # Fiji 
-    #HOF_ARCH="AMD:AMDGPU:8:0:3"
-
-    #$HOF_BIN/hof  -target $HOF_ARCH -output $TEMP_DIR/kernel.isa -brig $TEMP_DIR/kernel.brig
-
-    ret=$?
-    if [ $ret == 0 ]; then
-      # build a new kernel object
-      pushd . > /dev/null
-      cd $TEMP_DIR
-      $CLAMP_EMBED kernel.isa kernel_hof.o
-      popd > /dev/null
-
-      # debug purpose
-      # dump the brig
-      KMDUMPBRIG="${KMDUMPBRIG:=0}"
-      if [ $KMDUMPBRIG == "1" ]; then
-        cp $TEMP_DIR/kernel.isa ./dump.isa
+        # debug purpose
+        # dump the brig
+        KMDUMPBRIG="${KMDUMPBRIG:=0}"
+        if [ $KMDUMPBRIG == "1" ]; then
+          cp $TEMP_DIR/kernel_$TARGET_NAME.isa ./dump_$TARGET_NAME.isa
+        fi
       fi
-    fi
+    done
   fi
   
   if [ $ret == 0 ]; then
     # link everything together
     if [ $LOWER_OPENCL == 1 ] && [ $LOWER_HSA == 1 ] && [ $LOWER_HOF == 1 ]; then
-      ld --allow-multiple-definition $TEMP_DIR/kernel.o $TEMP_DIR/kernel_spir.o $TEMP_DIR/kernel_hsa.o $TEMP_DIR/kernel_hof.o $LINK_HOST_ARGS $LINK_CPU_ARG $LINK_OTHER_ARGS
+      ld --allow-multiple-definition $TEMP_DIR/kernel.o $TEMP_DIR/kernel_spir.o $TEMP_DIR/kernel_hsa.o $HOF_OBJECT_LIST $LINK_HOST_ARGS $LINK_CPU_ARG $LINK_OTHER_ARGS
     elif [ $LOWER_OPENCL == 1 ] && [ $LOWER_HSA == 1 ] && [ $LOWER_HOF == 0 ]; then
       ld --allow-multiple-definition $TEMP_DIR/kernel.o $TEMP_DIR/kernel_spir.o $TEMP_DIR/kernel_hsa.o $LINK_HOST_ARGS  $LINK_CPU_ARG $LINK_OTHER_ARGS
       ret=$?
@@ -331,8 +331,8 @@ if [ -e $TEMP_DIR/kernel_spir.o ]; then
   rm $TEMP_DIR/kernel_spir.o
 fi
 
-if [ -e $TEMP_DIR/kernel_hof.o ]; then
-  rm $TEMP_DIR/kernel_hof.o
+if [ -n "$HOF_OBJECT_LIST" ]; then
+  rm $HOF_OBJECT_LIST
 fi
 
 if [ -e $TEMP_DIR/kernel_hsa.o ]; then
