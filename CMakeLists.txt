@@ -412,7 +412,6 @@ install(FILES ${HSAILASM_BIN_DIR}/HSAILAsm/HSAILasm
         DESTINATION HSAILasm
         PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE
         COMPONENT HSAILasm)
-endif (NOT HSA_USE_AMDGPU_BACKEND)
 
 # Copy binary file to directory matching the install directory
 add_custom_target(HSAILasm_setup
