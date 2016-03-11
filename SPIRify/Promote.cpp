@@ -1281,7 +1281,7 @@ bool isAddressCopiedToHost(const GlobalVariable &G, const Function &F) {
             all_global_ptrs.insert(u);
             pending.insert(pending.end(), u->user_begin(), u->user_end());
         }
-        else if (const LoadInst *load = dyn_cast<LoadInst>(u)) {
+        else if (isa<LoadInst>(u)) {
             all_global_ptrs.insert(u);
             pending.insert(pending.end(), u->user_begin(), u->user_end());
         }
@@ -1639,14 +1639,14 @@ Function * createPromotedFunctionToType ( Function * F, FunctionType * promoteTy
             }
           }
 
-          StringRef newFuncName;
+          std::string newFuncName;
           Function *promotedFunction;
           switch (Addrspace) {
             case PrivateAddressSpace:
             case ConstantAddressSpace:
               break;
             case LocalAddressSpace:
-              newFuncName = (F->getName() + "_local").str();
+              newFuncName = F->getName().str() + "_local";
               DEBUG(llvm::errs() << newFuncName << "\n";);
               promotedFunction = F->getParent()->getFunction(newFuncName);
               if (!promotedFunction) { 
@@ -1656,7 +1656,7 @@ Function * createPromotedFunctionToType ( Function * F, FunctionType * promoteTy
               }
               break;
             case GlobalAddressSpace:
-              newFuncName = (F->getName() + "_global").str();
+              newFuncName = F->getName().str() + "_global";
               DEBUG(llvm::errs() << newFuncName << "\n";);
               promotedFunction = F->getParent()->getFunction(newFuncName);
               if (!promotedFunction) { 
